@@ -200,7 +200,8 @@
   .dlg-buttons { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
   .btn { border: 1px solid var(--border); background: transparent; padding: 9px 16px; border-radius: 10px; font-size: 15px; }
   .btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
-  .btn.danger { color: var(--danger); margin-right: auto; }
+  .btn.danger { color: var(--danger); }
+  .tag.saved { cursor: pointer; }
 
   .toast {
     position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 96px); transform: translateX(-50%);
@@ -268,11 +269,16 @@
     <label>ショートカット名
       <input type="text" id="shortcutName" autocomplete="off" autocapitalize="off" spellcheck="false">
     </label>
+    <label>1分あたりの解析枚数の上限
+      <input type="number" id="rpm" inputmode="numeric" min="1" max="1000">
+      <small>無料枠は 10 のままがおすすめ（超えるとエラーになります）。有料プランなら 60 などに上げると速くなります。</small>
+    </label>
     <label>モデル
       <input type="text" id="model" autocomplete="off" autocapitalize="off" spellcheck="false">
       <small>既定は <code>gemini-flash-lite-latest</code>（最新の Flash-Lite）。固定したい場合は <code>gemini-2.5-flash-lite</code> などを入力。</small>
     </label>
     <div class="dlg-buttons">
+      <button type="button" class="btn" id="unsaveAll" style="margin-right:auto">保存済みを全部戻す</button>
       <button type="button" class="btn danger" id="clearAll">履歴を全削除</button>
       <button type="button" class="btn" id="cancelSettings">キャンセル</button>
       <button type="submit" class="btn primary">保存</button>
@@ -330,7 +336,7 @@
     }
   };
 
-  let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL, mode: 'quiz', saveMethod: 'shortcut', shortcutName: 'スクショメモ保存' }, storage.get(KEY_SETTINGS, {}));
+  let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL, mode: 'quiz', rpm: 10, saveMethod: 'shortcut', shortcutName: 'スクショメモ保存' }, storage.get(KEY_SETTINGS, {}));
   let messages = storage.get(KEY_MESSAGES, []);
   if (!Array.isArray(messages)) messages = [];
   messages = messages.filter(m => !m.pending);
@@ -339,7 +345,7 @@
 
   function saveMessages() {
     updateSaveBar();
-    const data = messages.filter(m => !m.pending).map(({ _job, ...rest }) => rest);
+    const data = messages.filter(m => !m.pending).map(({ _job, thumbs, ...rest }) => rest);
     if (storage.set(KEY_MESSAGES, data)) return;
     // 容量オーバー時は古いサムネイルから削る
     for (const m of data) {
@@ -440,7 +446,9 @@
     if (m.kind === 'ocr') {
       const body = m.quiz ? renderQuizBody(m.quiz) : el('div', { class: 'card-body', text: m.text || '（文字が見つかりませんでした）' });
       const actions = el('div', { class: 'card-actions' }, [
-        chip('share', '共有', () => shareText(m.title, m.text), 'primary'),
+        chip('share', '共有', async () => {
+          if (await shareText(m.quiz ? '' : m.title, m.text)) { m.saved = true; saveMessages(); updateMessage(m); }
+        }, 'primary'),
         chip('copy', 'コピー', () => copyText(m.text)),
       ]);
       if (!m.quiz && (m.text || '').length > 400) {
@@ -457,7 +465,10 @@
             document.createTextNode(m.title || 'メモ'),
             m.quiz ? el('span', { class: 'tag', text: 'クイズ' }) : null,
             m.duplicate ? el('span', { class: 'tag dup', text: '重複' }) : null,
-            m.saved ? el('span', { class: 'tag saved', text: '保存済み' }) : null,
+            m.saved ? el('span', { class: 'tag saved', text: '保存済み ×', role: 'button', onclick: () => {
+              if (!confirm('「保存済み」を取り消して、もう一度一括保存の対象にしますか？')) return;
+              m.saved = false; saveMessages(); updateMessage(m);
+            } }) : null,
             el('span', { class: 'card-date', text: fmtDate(m.at) })
           ])
         ]),
@@ -625,7 +636,26 @@
   }
 
   // ---------- Gemini API ----------
+  // 無料枠の「1分あたりの回数制限」を超えないよう、リクエストの間隔をあける
+  let nextSlot = 0;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  async function waitTurn() {
+    const interval = 60000 / Math.max(1, Number(settings.rpm) || 10);
+    const now = Date.now();
+    const start = Math.max(now, nextSlot);
+    nextSlot = start + interval;
+    if (start > now) await sleep(start - now);
+  }
+
+  function retryDelayMs(data) {
+    const details = (data.error && data.error.details) || [];
+    const info = details.find(d => String(d['@type'] || '').endsWith('RetryInfo'));
+    const sec = info && parseFloat(info.retryDelay);
+    return sec ? sec * 1000 + 1000 : 0;
+  }
+
   async function callGemini(body, attempt = 0) {
+    await waitTurn();
     const model = (settings.model || DEFAULT_MODEL).trim().replace(/^models\//, '');
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
     let res;
@@ -640,16 +670,18 @@
     }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      if ((res.status === 429 || res.status >= 500) && attempt < 4) {
-        // 無料枠は1分あたりの回数制限があるため、429 のときは長めに待って再試行
-        await new Promise(r => setTimeout(r, (res.status === 429 ? 15000 : 3000) * (attempt + 1)));
+      if ((res.status === 429 || res.status >= 500) && attempt < 5) {
+        // 回数制限(429)のときは API が指示する時間だけ待ち、他のリクエストも止める
+        const wait = res.status === 429 ? (retryDelayMs(data) || 20000 * (attempt + 1)) : 3000 * (attempt + 1);
+        if (res.status === 429) nextSlot = Math.max(nextSlot, Date.now() + wait);
+        await sleep(wait);
         return callGemini(body, attempt + 1);
       }
       const msg = data.error && data.error.message || `HTTP ${res.status}`;
       if (res.status === 400 && /API key/i.test(msg)) throw new Error('APIキーが正しくありません。設定を確認してください。');
       if (res.status === 403) throw new Error('APIキーが使えません（権限・制限を確認してください）: ' + msg);
       if (res.status === 404) throw new Error(`モデル「${model}」が見つかりません。設定でモデル名を確認してください。`);
-      if (res.status === 429) throw new Error('利用上限に達しました。少し時間をおいて再試行してください。');
+      if (res.status === 429) throw new Error('利用上限に達しました（無料枠は1日の回数にも上限があります）。時間をおいて「再試行」を押してください。');
       throw new Error(msg);
     }
     const cand = data.candidates && data.candidates[0];
@@ -802,6 +834,18 @@
     await Promise.all(runners);
   }
 
+  let wakeLock = null;
+  async function keepAwake(on) {
+    try {
+      if (on && !wakeLock && navigator.wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      } else if (!on && wakeLock) {
+        await wakeLock.release(); wakeLock = null;
+      }
+    } catch { /* 非対応の端末では何もしない */ }
+  }
+
   async function send() {
     const text = inputEl.value.trim();
     const files = pendingFiles.slice();
@@ -821,6 +865,10 @@
           return { msg, file: f.file, instruction: text, mode: settings.mode };
         });
         saveMessages();
+        keepAwake(true);
+        if (jobs.length > Number(settings.rpm || 10)) {
+          toast(`${jobs.length}枚：約${Math.ceil(jobs.length / Number(settings.rpm || 10))}分かかります。画面を開いたままお待ちください`);
+        }
         await runPool(jobs, async job => {
           try {
             const p = await prepareFile(job.file, job.mode);
@@ -845,6 +893,7 @@
       }
     } finally {
       setBusy(-1);
+      if (busy === 0) keepAwake(false);
       scrollToBottom();
     }
   }
@@ -928,6 +977,7 @@
     $('model').value = settings.model || DEFAULT_MODEL;
     $('saveMethod').value = settings.saveMethod;
     $('shortcutName').value = settings.shortcutName;
+    $('rpm').value = settings.rpm;
     dlg.showModal();
   }
   $('openSettings').addEventListener('click', openSettings);
@@ -937,9 +987,16 @@
     settings.model = $('model').value.trim() || DEFAULT_MODEL;
     settings.saveMethod = $('saveMethod').value;
     settings.shortcutName = $('shortcutName').value.trim() || 'スクショメモ保存';
+    settings.rpm = Math.min(1000, Math.max(1, parseInt($('rpm').value, 10) || 10));
     storage.set(KEY_SETTINGS, settings);
     toast('保存しました');
     if (!messages.length) render();
+  });
+  $('unsaveAll').addEventListener('click', () => {
+    const list = messages.filter(m => m.saved);
+    if (!list.length) { toast('保存済みのメモはありません'); return; }
+    if (!confirm(`保存済みの ${list.length} 件を、もう一度一括保存の対象に戻しますか？`)) return;
+    list.forEach(m => { m.saved = false; }); saveMessages(); render(); dlg.close();
   });
   $('clearAll').addEventListener('click', () => {
     if (!confirm('すべての履歴（メモ）を削除します。よろしいですか？')) return;
