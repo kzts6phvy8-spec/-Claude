@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<title>スクショメモ</title>
+<meta name="description" content="スクリーンショットをAI（Gemini Flash-Lite）でテキスト化してメモにするチャットアプリ">
+<meta name="theme-color" content="#faf8f5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1f1e1c" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="スクショメモ">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="icon-192.png">
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  :root {
+    --bg: #faf8f5;
+    --surface: #ffffff;
+    --surface-2: #f2eee8;
+    --text: #1f1e1c;
+    --muted: #6f6b64;
+    --border: #e4ded5;
+    --accent: #c9643f;
+    --accent-text: #ffffff;
+    --user-bubble: #efe9e1;
+    --danger: #b3261e;
+    --shadow: 0 1px 2px rgba(0,0,0,.06), 0 2px 8px rgba(0,0,0,.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1f1e1c;
+      --surface: #2a2926;
+      --surface-2: #33312d;
+      --text: #f1ede7;
+      --muted: #a8a299;
+      --border: #3d3a35;
+      --accent: #e0805c;
+      --accent-text: #1f1e1c;
+      --user-bubble: #3a3733;
+      --danger: #f2a49d;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+    overflow: hidden;
+  }
+  button { font: inherit; color: inherit; cursor: pointer; }
+
+  /* ヘッダー */
+  header {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: calc(env(safe-area-inset-top) + 8px) 16px 8px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
+  header h1 { flex: 1; margin: 0; font-size: 17px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  header h1 img { width: 26px; height: 26px; border-radius: 7px; }
+  .icon-btn {
+    border: none; background: transparent; padding: 8px; border-radius: 10px;
+    display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px;
+  }
+  .icon-btn:active { background: var(--surface-2); }
+  .icon-btn svg { width: 22px; height: 22px; }
+
+  /* チャット */
+  #chat { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 16px 16px 8px; }
+  .inner { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+
+  .welcome { text-align: center; padding: 32px 8px; color: var(--muted); }
+  .welcome img { width: 72px; height: 72px; border-radius: 18px; margin-bottom: 12px; }
+  .welcome h2 { color: var(--text); font-size: 20px; margin: 0 0 8px; }
+  .welcome ol { text-align: left; display: inline-block; margin: 12px 0 0; padding-left: 1.4em; }
+  .welcome li { margin: 4px 0; }
+
+  .msg-user { align-self: flex-end; max-width: 85%; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+  .msg-user .bubble { background: var(--user-bubble); padding: 10px 14px; border-radius: 18px 18px 4px 18px; white-space: pre-wrap; word-break: break-word; }
+  .thumbs { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
+  .thumbs img { width: 56px; height: 100px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); }
+
+  .msg-model { align-self: flex-start; width: 100%; }
+  .msg-model .plain { white-space: pre-wrap; word-break: break-word; padding: 2px 2px; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: var(--shadow); overflow: hidden;
+  }
+  .card-head { display: flex; gap: 10px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .card-head img { width: 32px; height: 56px; object-fit: cover; border-radius: 5px; border: 1px solid var(--border); flex: none; }
+  .card-title { flex: 1; font-weight: 600; font-size: 15px; line-height: 1.4; word-break: break-word; }
+  .card-date { font-size: 12px; color: var(--muted); font-weight: 400; display: block; }
+  .card-body { padding: 12px; white-space: pre-wrap; word-break: break-word; font-size: 15px; max-height: 320px; overflow-y: auto; }
+  .card-body.expanded { max-height: none; }
+  .card-actions { display: flex; gap: 4px; padding: 6px 8px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+  .chip {
+    border: none; background: transparent; color: var(--muted); padding: 6px 10px; border-radius: 8px;
+    font-size: 13px; display: inline-flex; align-items: center; gap: 4px;
+  }
+  .chip:active { background: var(--surface-2); }
+  .chip.primary { color: var(--accent); font-weight: 600; }
+  .chip svg { width: 16px; height: 16px; }
+  .chip.right { margin-left: auto; }
+
+  .error { color: var(--danger); background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; font-size: 14px; }
+  .loading { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; padding: 10px 12px; }
+  .dots span { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 3px; animation: blink 1.2s infinite both; }
+  .dots span:nth-child(2) { animation-delay: .2s; }
+  .dots span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .2; } 40% { opacity: 1; } }
+
+  /* 入力欄 */
+  footer { flex: none; padding: 8px 12px calc(env(safe-area-inset-bottom) + 8px); background: var(--bg); }
+  .composer {
+    max-width: 720px; margin: 0 auto; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 22px; box-shadow: var(--shadow); padding: 6px;
+  }
+  #pending { display: none; gap: 6px; padding: 6px 6px 2px; overflow-x: auto; }
+  #pending.show { display: flex; }
+  .pend { position: relative; flex: none; }
+  .pend img { width: 52px; height: 92px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); display: block; }
+  .pend button {
+    position: absolute; top: -6px; right: -6px; width: 22px; height: 22px; border-radius: 50%;
+    border: none; background: var(--text); color: var(--bg); font-size: 13px; line-height: 22px; padding: 0;
+  }
+  .row { display: flex; align-items: flex-end; gap: 4px; }
+  #input {
+    flex: 1; border: none; outline: none; resize: none; background: transparent; color: var(--text);
+    font: inherit; font-size: 16px; line-height: 1.5; padding: 8px 4px; max-height: 140px; min-height: 40px;
+  }
+  #input::placeholder { color: var(--muted); }
+  #send {
+    width: 36px; height: 36px; border-radius: 50%; border: none; background: var(--accent); color: var(--accent-text);
+    display: inline-flex; align-items: center; justify-content: center; margin: 2px; flex: none;
+  }
+  #send:disabled { opacity: .35; }
+  #send svg { width: 18px; height: 18px; }
+  .note { text-align: center; font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+  /* 設定ダイアログ */
+  dialog {
+    border: none; border-radius: 18px; padding: 0; width: min(440px, calc(100vw - 32px));
+    background: var(--surface); color: var(--text); box-shadow: 0 10px 40px rgba(0,0,0,.25);
+  }
+  dialog::backdrop { background: rgba(0,0,0,.4); }
+  .dlg { padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+  .dlg h2 { margin: 0; font-size: 18px; }
+  .dlg label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; font-weight: 600; }
+  .dlg input {
+    font: inherit; font-size: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-weight: 400;
+  }
+  .dlg small { color: var(--muted); font-weight: 400; font-size: 12px; line-height: 1.5; }
+  .dlg a { color: var(--accent); }
+  .dlg-buttons { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+  .btn { border: 1px solid var(--border); background: transparent; padding: 9px 16px; border-radius: 10px; font-size: 15px; }
+  .btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  .btn.danger { color: var(--danger); margin-right: auto; }
+
+  .toast {
+    position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 96px); transform: translateX(-50%);
+    background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 20px; font-size: 14px;
+    opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 10; max-width: calc(100vw - 32px);
+  }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1><img src="icon-192.png" alt="">スクショメモ</h1>
+  <button class="icon-btn" id="exportAll" aria-label="すべてのメモを書き出す" title="すべて書き出し">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 8 5-5 5 5"/><path d="M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/></svg>
+  </button>
+  <button class="icon-btn" id="openSettings" aria-label="設定" title="設定">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+  </button>
+</header>
+
+<main id="chat"><div class="inner" id="messages"></div></main>
+
+<footer>
+  <div class="composer">
+    <div id="pending"></div>
+    <div class="row">
+      <button class="icon-btn" id="attach" aria-label="スクリーンショットを追加" title="スクリーンショットを追加">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>
+      </button>
+      <textarea id="input" rows="1" placeholder="スクショ追加・メッセージ入力"></textarea>
+      <button id="send" aria-label="送信" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="note">Gemini Flash-Lite で解析・データは端末内に保存</div>
+  <input type="file" id="file" accept="image/*" multiple hidden>
+</footer>
+
+<dialog id="settings">
+  <form method="dialog" class="dlg" id="settingsForm">
+    <h2>設定</h2>
+    <label>Gemini APIキー
+      <input type="password" id="apiKey" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="AIza...">
+      <small><a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> で無料で発行できます。キーはこの端末のブラウザにだけ保存され、GitHub には公開されません。</small>
+    </label>
+    <label>モデル
+      <input type="text" id="model" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <small>既定は <code>gemini-flash-lite-latest</code>（最新の Flash-Lite）。固定したい場合は <code>gemini-2.5-flash-lite</code> などを入力。</small>
+    </label>
+    <div class="dlg-buttons">
+      <button type="button" class="btn danger" id="clearAll">履歴を全削除</button>
+      <button type="button" class="btn" id="cancelSettings">キャンセル</button>
+      <button type="submit" class="btn primary">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  const DEFAULT_MODEL = 'gemini-flash-lite-latest';
+  const KEY_SETTINGS = 'screenmemo.settings';
+  const KEY_MESSAGES = 'screenmemo.messages';
+  const CONCURRENCY = 2;
+
+  const OCR_SYSTEM = [
+    'あなたはスマートフォンのスクリーンショットを読み取り、メモとして保存できるテキストに変換するアシスタントです。',
+    '・画像内の文章を、改行や箇条書きの構造をできるだけ保って正確に書き起こしてください。',
+    '・ステータスバー（時刻・電波・電池）、キーボード、ナビゲーションバー、広告などの本文と無関係な UI は除外してください。',
+    '・チャット画面の場合は「名前: 発言」の形式で書き起こしてください。',
+    '・内容を推測で補ったり要約したりしないでください（ユーザーから追加の指示がある場合はそれに従ってください）。',
+    '・title には内容が一目で分かる20文字程度の日本語のタイトルを付けてください。',
+    '・文字が読み取れない場合は text を空文字にしてください。'
+  ].join('\n');
+
+  const CHAT_SYSTEM = [
+    'あなたは「スクショメモ」アプリのアシスタントです。',
+    'ユーザーはスクリーンショットからテキスト化したメモについて質問したり、要約・整理・翻訳などを依頼します。',
+    '会話履歴にあるメモの内容をもとに、日本語で簡潔に答えてください。Markdown の装飾は使わず、プレーンテキストで答えてください。'
+  ].join('\n');
+
+  // ---------- 保存 ----------
+  const storage = {
+    get(key, fallback) {
+      try { const v = localStorage.getItem(key); return v == null ? fallback : JSON.parse(v); }
+      catch { return fallback; }
+    },
+    set(key, value) {
+      try { localStorage.setItem(key, JSON.stringify(value)); return true; }
+      catch { return false; }
+    }
+  };
+
+  let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL }, storage.get(KEY_SETTINGS, {}));
+  let messages = storage.get(KEY_MESSAGES, []);
+  if (!Array.isArray(messages)) messages = [];
+  messages = messages.filter(m => !m.pending);
+  let pendingFiles = [];   // { id, file, thumb }
+  let busy = 0;
+
+  function saveMessages() {
+    const data = messages.filter(m => !m.pending).map(({ _job, ...rest }) => rest);
+    if (storage.set(KEY_MESSAGES, data)) return;
+    // 容量オーバー時は古いサムネイルから削る
+    for (const m of data) {
+      if (m.thumb) delete m.thumb;
+      if (m.thumbs) delete m.thumbs;
+      if (storage.set(KEY_MESSAGES, data)) { toast('保存容量が少ないため古いサムネイルを削除しました'); return; }
+    }
+    toast('保存に失敗しました。古い履歴を削除してください');
+  }
+
+  // ---------- DOM ----------
+  const $ = id => document.getElementById(id);
+  const chatEl = $('chat'), listEl = $('messages'), inputEl = $('input'), sendEl = $('send');
+  const fileEl = $('file'), pendingEl = $('pending'), dlg = $('settings');
+
+  const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const fmtDate = ts => new Date(ts).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+  function el(tag, attrs = {}, children = []) {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === 'class') e.className = v;
+      else if (k === 'text') e.textContent = v;
+      else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
+      else e.setAttribute(k, v);
+    }
+    for (const c of [].concat(children)) if (c) e.append(c);
+    return e;
+  }
+
+  const ICONS = {
+    copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+    share: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 8 5-5 5 5"/><path d="M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg>',
+    expand: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>',
+    retry: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>'
+  };
+  function chip(icon, label, onclick, cls = '') {
+    const b = el('button', { class: 'chip ' + cls, type: 'button', onclick });
+    b.innerHTML = ICONS[icon];
+    b.append(label);
+    return b;
+  }
+
+  // ---------- 描画 ----------
+  function render() {
+    listEl.replaceChildren();
+    if (!messages.length) {
+      const w = el('div', { class: 'welcome' }, [
+        el('img', { src: 'icon-192.png', alt: '' }),
+        el('h2', { text: 'スクショをテキストに' }),
+        el('div', { text: 'スクリーンショットを送ると、AI が文字を読み取ってメモにします。' }),
+        el('ol', {}, [
+          el('li', { text: settings.apiKey ? '✓ APIキー設定済み' : '右上の ⚙ から Gemini APIキーを設定' }),
+          el('li', { text: '左下の画像ボタンでスクショを選択（複数可）' }),
+          el('li', { text: '送信 → 結果の「共有」から「メモ」アプリへ保存' }),
+          el('li', { text: '保存したら写真アプリでスクショを削除して容量を空ける' })
+        ])
+      ]);
+      listEl.append(w);
+      return;
+    }
+    for (const m of messages) listEl.append(renderMessage(m));
+  }
+
+  function renderMessage(m) {
+    if (m.role === 'user') {
+      const wrap = el('div', { class: 'msg-user', 'data-id': m.id });
+      if (m.thumbs && m.thumbs.length) {
+        wrap.append(el('div', { class: 'thumbs' }, m.thumbs.map(src => el('img', { src, alt: 'スクリーンショット' }))));
+      } else if (m.imageCount) {
+        wrap.append(el('div', { class: 'bubble', text: `🖼 スクリーンショット ${m.imageCount}枚` }));
+      }
+      if (m.text) wrap.append(el('div', { class: 'bubble', text: m.text }));
+      return wrap;
+    }
+
+    const wrap = el('div', { class: 'msg-model', 'data-id': m.id });
+    if (m.pending) {
+      const dots = el('span', { class: 'dots' }); dots.innerHTML = '<span></span><span></span><span></span>';
+      wrap.append(el('div', { class: m.kind === 'ocr' ? 'card' : '' }, [
+        el('div', { class: 'loading' }, [dots, el('span', { text: m.kind === 'ocr' ? '文字を読み取っています…' : '考えています…' })])
+      ]));
+      return wrap;
+    }
+    if (m.kind === 'error') {
+      const box = el('div', { class: 'error', text: '⚠️ ' + m.text });
+      wrap.append(box);
+      if (m.retry) {
+        const actions = el('div', { class: 'card-actions', style: 'border:none;padding:4px 0' }, [
+          chip('retry', '再試行', () => retry(m), 'primary'),
+          chip('trash', '削除', () => removeMessage(m.id), 'right')
+        ]);
+        wrap.append(actions);
+      }
+      return wrap;
+    }
+    if (m.kind === 'ocr') {
+      const body = el('div', { class: 'card-body', text: m.text || '（文字が見つかりませんでした）' });
+      const actions = el('div', { class: 'card-actions' }, [
+        chip('share', '共有', () => shareText(m.title, m.text), 'primary'),
+        chip('copy', 'コピー', () => copyText(m.text)),
+      ]);
+      if ((m.text || '').length > 400) {
+        actions.append(chip('expand', '全文', (e) => {
+          body.classList.toggle('expanded');
+          e.currentTarget.lastChild.textContent = body.classList.contains('expanded') ? '閉じる' : '全文';
+        }));
+      }
+      actions.append(chip('trash', '削除', () => removeMessage(m.id), 'right'));
+      wrap.append(el('div', { class: 'card' }, [
+        el('div', { class: 'card-head' }, [
+          m.thumb ? el('img', { src: m.thumb, alt: '' }) : null,
+          el('div', { class: 'card-title' }, [document.createTextNode(m.title || 'メモ'), el('span', { class: 'card-date', text: fmtDate(m.at) })])
+        ]),
+        body,
+        actions
+      ]));
+      return wrap;
+    }
+    // 通常のチャット返答
+    wrap.append(el('div', { class: 'plain', text: m.text }));
+    wrap.append(el('div', { class: 'card-actions', style: 'border:none;padding:2px 0' }, [
+      chip('copy', 'コピー', () => copyText(m.text)),
+      chip('share', '共有', () => shareText('', m.text))
+    ]));
+    return wrap;
+  }
+
+  function updateMessage(m) {
+    const old = listEl.querySelector(`[data-id="${m.id}"]`);
+    if (old) old.replaceWith(renderMessage(m)); else render();
+  }
+
+  function addMessage(m) {
+    if (!messages.length) listEl.replaceChildren();
+    messages.push(m);
+    listEl.append(renderMessage(m));
+    scrollToBottom();
+  }
+
+  function removeMessage(id) {
+    messages = messages.filter(m => m.id !== id);
+    saveMessages();
+    render();
+  }
+
+  function scrollToBottom() {
+    requestAnimationFrame(() => { chatEl.scrollTop = chatEl.scrollHeight; });
+  }
+
+  let toastTimer;
+  function toast(msg) {
+    const t = $('toast');
+    t.textContent = msg; t.classList.add('show');
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+  }
+
+  // ---------- コピー / 共有 ----------
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); }
+    catch {
+      const ta = el('textarea', { style: 'position:fixed;opacity:0' }); ta.value = text;
+      document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
+    }
+    toast('コピーしました');
+  }
+
+  async function shareText(title, text) {
+    const content = title ? `${title}\n\n${text}` : text;
+    if (navigator.share) {
+      try { await navigator.share({ text: content }); } catch (e) { if (e.name !== 'AbortError') copyText(content); }
+    } else {
+      copyText(content);
+    }
+  }
+
+  $('exportAll').addEventListener('click', () => {
+    const memos = messages.filter(m => m.kind === 'ocr' && m.text);
+    if (!memos.length) { toast('書き出すメモがありません'); return; }
+    const text = memos.map(m => `■ ${m.title || 'メモ'}（${fmtDate(m.at)}）\n${m.text}`).join('\n\n');
+    shareText('', text);
+  });
+
+  // ---------- 画像処理 ----------
+  async function loadBitmap(file) {
+    if ('createImageBitmap' in window) {
+      try { return await createImageBitmap(file); } catch { /* fallthrough */ }
+    }
+    return await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('画像を読み込めませんでした'));
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  function drawScaled(src, maxSide, type, quality) {
+    const w = src.width, h = src.height;
+    const scale = Math.min(1, maxSide / Math.max(w, h));
+    const c = document.createElement('canvas');
+    c.width = Math.round(w * scale); c.height = Math.round(h * scale);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(src, 0, 0, c.width, c.height);
+    return c.toDataURL(type, quality);
+  }
+
+  async function prepareFile(file) {
+    const bmp = await loadBitmap(file);
+    const thumb = drawScaled(bmp, 180, 'image/jpeg', 0.6);
+    // 縦長のスクショでも文字が潰れないよう長辺 3072px まで
+    const full = drawScaled(bmp, 3072, 'image/jpeg', 0.88);
+    if (bmp.close) bmp.close();
+    return { thumb, base64: full.split(',')[1] };
+  }
+
+  // ---------- Gemini API ----------
+  async function callGemini(body, attempt = 0) {
+    const model = (settings.model || DEFAULT_MODEL).trim().replace(/^models\//, '');
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.apiKey.trim() },
+        body: JSON.stringify(body)
+      });
+    } catch {
+      throw new Error('通信できませんでした。電波状況を確認してください。');
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if ((res.status === 429 || res.status >= 500) && attempt < 2) {
+        await new Promise(r => setTimeout(r, (attempt + 1) * 4000));
+        return callGemini(body, attempt + 1);
+      }
+      const msg = data.error && data.error.message || `HTTP ${res.status}`;
+      if (res.status === 400 && /API key/i.test(msg)) throw new Error('APIキーが正しくありません。設定を確認してください。');
+      if (res.status === 403) throw new Error('APIキーが使えません（権限・制限を確認してください）: ' + msg);
+      if (res.status === 404) throw new Error(`モデル「${model}」が見つかりません。設定でモデル名を確認してください。`);
+      if (res.status === 429) throw new Error('利用上限に達しました。少し時間をおいて再試行してください。');
+      throw new Error(msg);
+    }
+    const cand = data.candidates && data.candidates[0];
+    const text = cand && cand.content && (cand.content.parts || []).map(p => p.text || '').join('') || '';
+    if (!text) {
+      const reason = (data.promptFeedback && data.promptFeedback.blockReason) || (cand && cand.finishReason) || '不明';
+      throw new Error(`AIから結果が返りませんでした（理由: ${reason}）`);
+    }
+    return text;
+  }
+
+  async function ocr(base64, instruction) {
+    const raw = await callGemini({
+      systemInstruction: { parts: [{ text: OCR_SYSTEM }] },
+      contents: [{
+        role: 'user',
+        parts: [
+          { inlineData: { mimeType: 'image/jpeg', data: base64 } },
+          { text: instruction ? `追加の指示: ${instruction}` : 'このスクリーンショットをテキスト化してください。' }
+        ]
+      }],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: { title: { type: 'STRING' }, text: { type: 'STRING' } },
+          required: ['title', 'text']
+        }
+      }
+    });
+    try {
+      const j = JSON.parse(raw);
+      return { title: String(j.title || '').trim(), text: String(j.text || '').trim() };
+    } catch {
+      return { title: '', text: raw.trim() };
+    }
+  }
+
+  function buildHistory(upto) {
+    const recent = messages.slice(0, upto).filter(m => !m.pending && m.kind !== 'error').slice(-30);
+    const contents = [];
+    for (const m of recent) {
+      let role, text;
+      if (m.role === 'user') {
+        role = 'user';
+        text = [m.imageCount ? `（スクリーンショットを${m.imageCount}枚送信）` : '', m.text || ''].filter(Boolean).join('\n');
+      } else {
+        role = 'model';
+        text = m.kind === 'ocr' ? `【メモ: ${m.title || '無題'}】\n${m.text}` : m.text;
+      }
+      if (!text) continue;
+      const last = contents[contents.length - 1];
+      if (last && last.role === role) last.parts.push({ text });
+      else contents.push({ role, parts: [{ text }] });
+    }
+    while (contents.length && contents[0].role !== 'user') contents.shift();
+    return contents;
+  }
+
+  async function chat(modelMsg) {
+    const idx = messages.indexOf(modelMsg);
+    const contents = buildHistory(idx);
+    return callGemini({
+      systemInstruction: { parts: [{ text: CHAT_SYSTEM }] },
+      contents,
+      generationConfig: { temperature: 0.4 }
+    });
+  }
+
+  // ---------- 送信 ----------
+  function setBusy(delta) {
+    busy += delta;
+    updateSendState();
+  }
+
+  function updateSendState() {
+    sendEl.disabled = busy > 0 || (!inputEl.value.trim() && !pendingFiles.length);
+  }
+
+  async function runOcrJob(job) {
+    const m = job.msg;
+    try {
+      const r = await ocr(job.base64, job.instruction);
+      Object.assign(m, { pending: false, kind: 'ocr', title: r.title, text: r.text });
+      delete m.retry; delete m._job;
+    } catch (e) {
+      Object.assign(m, { pending: false, kind: 'error', text: e.message, retry: { type: 'ocr' } });
+      m._job = job; // 再試行用（保存はしない）
+    }
+    updateMessage(m);
+    saveMessages();
+  }
+
+  async function runPool(jobs, worker) {
+    let i = 0;
+    const runners = Array.from({ length: Math.min(CONCURRENCY, jobs.length) }, async () => {
+      while (i < jobs.length) await worker(jobs[i++]);
+    });
+    await Promise.all(runners);
+  }
+
+  async function send() {
+    const text = inputEl.value.trim();
+    const files = pendingFiles.slice();
+    if (!text && !files.length) return;
+    if (!settings.apiKey) { toast('先に Gemini APIキーを設定してください'); openSettings(); return; }
+
+    inputEl.value = ''; autoResize();
+    pendingFiles = []; renderPending();
+    setBusy(1);
+
+    try {
+      if (files.length) {
+        addMessage({ id: uid(), role: 'user', text, thumbs: files.map(f => f.thumb), imageCount: files.length, at: Date.now() });
+        const jobs = files.map(f => {
+          const msg = { id: uid(), role: 'model', kind: 'ocr', pending: true, thumb: f.thumb, at: Date.now() };
+          addMessage(msg);
+          return { msg, file: f.file, instruction: text };
+        });
+        saveMessages();
+        await runPool(jobs, async job => {
+          try {
+            const p = await prepareFile(job.file);
+            job.base64 = p.base64;
+          } catch (e) {
+            Object.assign(job.msg, { pending: false, kind: 'error', text: e.message });
+            updateMessage(job.msg); saveMessages();
+            return;
+          }
+          await runOcrJob(job);
+        });
+        const ok = jobs.filter(j => j.msg.kind === 'ocr').length;
+        if (jobs.length > 1) toast(`${ok} / ${jobs.length}枚をテキスト化しました`);
+      } else {
+        addMessage({ id: uid(), role: 'user', text, at: Date.now() });
+        const msg = { id: uid(), role: 'model', kind: 'text', pending: true, at: Date.now() };
+        addMessage(msg);
+        saveMessages();
+        await runChat(msg);
+      }
+    } finally {
+      setBusy(-1);
+      scrollToBottom();
+    }
+  }
+
+  async function runChat(msg) {
+    try {
+      const reply = await chat(msg);
+      Object.assign(msg, { pending: false, kind: 'text', text: reply.trim() });
+      delete msg.retry;
+    } catch (e) {
+      Object.assign(msg, { pending: false, kind: 'error', text: e.message, retry: { type: 'chat' } });
+    }
+    updateMessage(msg);
+    saveMessages();
+  }
+
+  async function retry(m) {
+    if (m.retry.type === 'ocr' && !m._job) {
+      toast('画像がもう手元にないため、もう一度スクショを送ってください');
+      return;
+    }
+    setBusy(1);
+    m.pending = true;
+    m.kind = m.retry.type === 'ocr' ? 'ocr' : 'text';
+    updateMessage(m);
+    try {
+      if (m.retry.type === 'ocr') await runOcrJob(m._job);
+      else await runChat(m);
+    } finally { setBusy(-1); }
+  }
+
+  // ---------- 入力欄 ----------
+  function autoResize() {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + 'px';
+    updateSendState();
+  }
+  inputEl.addEventListener('input', autoResize);
+  inputEl.addEventListener('keydown', e => {
+    // PC では Enter で送信（日本語変換中は除く）。スマホでは改行。
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(pointer: fine)').matches) {
+      e.preventDefault(); if (!sendEl.disabled) send();
+    }
+  });
+  sendEl.addEventListener('click', send);
+  $('attach').addEventListener('click', () => fileEl.click());
+
+  fileEl.addEventListener('change', async () => {
+    const files = Array.from(fileEl.files || []);
+    fileEl.value = '';
+    for (const file of files) {
+      try {
+        const bmp = await loadBitmap(file);
+        const thumb = drawScaled(bmp, 180, 'image/jpeg', 0.6);
+        if (bmp.close) bmp.close();
+        pendingFiles.push({ id: uid(), file, thumb });
+      } catch {
+        toast(`${file.name} を読み込めませんでした`);
+      }
+    }
+    renderPending();
+  });
+
+  function renderPending() {
+    pendingEl.replaceChildren(...pendingFiles.map(p => el('div', { class: 'pend' }, [
+      el('img', { src: p.thumb, alt: '' }),
+      el('button', { type: 'button', 'aria-label': '取り消す', text: '×', onclick: () => {
+        pendingFiles = pendingFiles.filter(x => x.id !== p.id); renderPending();
+      } })
+    ])));
+    pendingEl.classList.toggle('show', pendingFiles.length > 0);
+    inputEl.placeholder = pendingFiles.length
+      ? `${pendingFiles.length}枚を送信（指示は任意）`
+      : 'スクショ追加・メッセージ入力';
+    updateSendState();
+  }
+
+  // ---------- 設定 ----------
+  function openSettings() {
+    $('apiKey').value = settings.apiKey;
+    $('model').value = settings.model || DEFAULT_MODEL;
+    dlg.showModal();
+  }
+  $('openSettings').addEventListener('click', openSettings);
+  $('cancelSettings').addEventListener('click', () => dlg.close());
+  $('settingsForm').addEventListener('submit', () => {
+    settings.apiKey = $('apiKey').value.trim();
+    settings.model = $('model').value.trim() || DEFAULT_MODEL;
+    storage.set(KEY_SETTINGS, settings);
+    toast('保存しました');
+    if (!messages.length) render();
+  });
+  $('clearAll').addEventListener('click', () => {
+    if (!confirm('すべての履歴（メモ）を削除します。よろしいですか？')) return;
+    messages = []; saveMessages(); render(); dlg.close();
+  });
+
+  render();
+  scrollToBottom();
+  if (!settings.apiKey) setTimeout(openSettings, 300);
+})();
+</script>
+</body>
+</html>

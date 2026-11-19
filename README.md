@@ -1,60 +1,50 @@
 # スクショメモ（ScreenMemo）
 
-iPhone の写真に溜まったスクリーンショットを **AI で文字認識（OCR）してテキスト化** し、
-メモとして保存・検索・書き出しできる iOS アプリです。テキスト化した後は元のスクリーンショットを削除して容量を空けられます。
+iPhone の写真に溜まったスクリーンショットを **AI（Google Gemini Flash-Lite）でテキスト化** し、
+チャット感覚でメモにできるアプリです。テキスト化した後はスクショを削除して容量を空けられます。
 
-## 主な機能
+## 🌐 Web アプリ版（おすすめ・Mac 不要）
 
-- 写真ライブラリから **スクリーンショットだけ** を一覧表示（変換済みには「変換済み」バッジ）
-- 「未変換を全選択」でまとめてテキスト化
-- Apple の Vision フレームワークによる **端末内 AI 文字認識**（日本語・英語対応、外部送信なし・無料）
-- テキストはアプリ内にメモとして保存（全文検索・編集・コピー・小さなサムネイル付き）
-- 共有ボタンから **Apple の「メモ」アプリ** などに送信（1件ずつ / まとめて）
-- 「変換後にスクリーンショットを削除」をオンにすると、テキスト化に成功した画像だけを削除
-  （文字が見つからなかった画像は削除しません）
+`docs/` フォルダの Web アプリを GitHub Pages で公開し、iPhone の Safari から使います。
 
-> ⚠️ 削除した画像は写真アプリの「最近削除した項目」に30日間残ります。すぐに容量を空けたい場合はそこも空にしてください。
+### 使い方
 
-> ℹ️ Apple の「メモ」アプリには他アプリから直接書き込む公開 API がないため、共有シート経由で保存します。
+1. 画面右上の ⚙ から **Gemini APIキー** を入力（[Google AI Studio](https://aistudio.google.com/apikey) で無料発行）
+2. 左下の画像ボタンからスクリーンショットを選択（複数枚まとめて OK）→ 送信
+3. AI が読み取った結果がカードで表示されるので、**「共有」→「メモ」** で iPhone のメモアプリに保存
+   （右上の ↑ ボタンで全メモをまとめて書き出しも可能）
+4. 「この中で予定だけまとめて」など、チャット欄で続けて質問・整理を依頼できます
+5. 保存が終わったら、写真アプリの「スクリーンショット」アルバムで画像を削除
+   → 「最近削除した項目」も空にすると容量が空きます
 
-## ビルド方法（Mac が必要）
+Safari の共有ボタン →「ホーム画面に追加」で、アプリのように全画面で使えます。
 
-1. Mac に Xcode 15 以降と [XcodeGen](https://github.com/yonaskolb/XcodeGen) をインストール
-   ```sh
-   brew install xcodegen
-   ```
-2. このリポジトリで Xcode プロジェクトを生成して開く
-   ```sh
-   xcodegen generate
-   open ScreenMemo.xcodeproj
-   ```
-3. Xcode で `ScreenMemo` ターゲット → Signing & Capabilities → Team に自分の Apple ID を設定
-   （`PRODUCT_BUNDLE_IDENTIFIER` の `com.example.screenmemo` は自分用の一意な ID に変更）
-4. iPhone を Mac に接続して実行（無料の Apple ID でも自分の iPhone にインストール可能。
-   その場合 7 日ごとに再インストールが必要です）
+### 公開手順（GitHub Pages）
 
-要件: iOS 17 以降
+1. GitHub のリポジトリ → **Settings → General → Danger Zone → Change visibility → Public**
+2. **Settings → Pages** → Source: *Deploy from a branch* → Branch: `main`、フォルダ: `/docs` → Save
+3. 数分後 `https://<ユーザー名>.github.io/<リポジトリ名>/` で開けます
 
-## 構成
+### セキュリティ・プライバシー
 
+- APIキーは **iPhone のブラウザ内（localStorage）にだけ保存** され、GitHub には一切含まれません。
+- 念のため Google Cloud コンソールで APIキーに「HTTP リファラー制限（`https://<ユーザー名>.github.io/*`）」を付けることをおすすめします。
+- 画像は Google の Gemini API に送信されます。**無料枠では送信内容が Google のサービス改善に使われる場合があります**。
+  パスワードや個人情報が写ったスクショは送らないか、有料枠（課金設定）を利用してください。
+- Web アプリはブラウザの制約で写真を直接削除できないため、削除は写真アプリで行ってください。
+
+### 設定できるモデル
+
+既定は `gemini-flash-lite-latest`（常に最新の Flash-Lite）。
+動作を固定したい場合は設定画面で `gemini-2.5-flash-lite` などに変更できます。
+
+## 📱 ネイティブ iOS アプリ版（Mac + Xcode が必要）
+
+`ScreenMemo/` に SwiftUI 版があります。写真ライブラリから直接スクショを一覧・一括変換・自動削除でき、
+文字認識は端末内（Apple Vision）で行います。
+
+```sh
+brew install xcodegen
+xcodegen generate
+open ScreenMemo.xcodeproj   # Signing の Team を設定して iPhone で実行（iOS 17 以降）
 ```
-ScreenMemo/
-├── ScreenMemoApp.swift          アプリのエントリポイント（SwiftData）
-├── Models/Memo.swift            メモのデータモデル
-├── Services/OCRService.swift    Vision による文字認識
-├── Services/ScreenshotLibrary.swift  スクリーンショットの取得・削除
-└── Views/
-    ├── ContentView.swift        メモ一覧・検索・まとめて書き出し
-    ├── ImportView.swift         スクリーンショット選択・テキスト化
-    └── MemoDetailView.swift     メモの編集・コピー・共有
-```
-
-## Mac がない場合：「ショートカット」アプリで同じことをする
-
-iPhone 標準の「ショートカット」アプリでも、簡易版を作れます。
-
-1. 「写真を検索」— フィルタ: *スクリーンショットである*、並び順: 作成日（新しい順）、制限: 例 20 枚
-2. 「各項目を反復」
-   - 「画像からテキストを抽出」（入力: 反復項目）
-   - 「メモを作成」（本文: 抽出したテキスト）
-3. 反復の終了後に「写真を削除」（入力: 写真）※確認が表示されます
