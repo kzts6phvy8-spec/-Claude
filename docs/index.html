@@ -156,6 +156,20 @@
   .seg button { border: none; background: transparent; padding: 4px 12px; border-radius: 999px; font-size: 13px; color: var(--muted); }
   .seg button[aria-pressed="true"] { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: var(--shadow); }
 
+  /* 一括保存バー */
+  .savebar {
+    max-width: 720px; margin: 0 auto 8px; display: none; align-items: center; gap: 10px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 8px 8px 8px 14px; box-shadow: var(--shadow);
+  }
+  .savebar.show { display: flex; }
+  .savebar span { flex: 1; font-size: 14px; }
+  .savebar b { color: var(--accent); }
+  .tag.saved { background: #dcefdc; color: #2d6a2d; }
+  .dlg select {
+    font: inherit; font-size: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-weight: 400;
+  }
+
   /* クイズカード */
   .quiz-q { display: flex; gap: 8px; }
   .quiz-a { display: flex; gap: 8px; margin-top: 10px; align-items: baseline; flex-wrap: wrap; }
@@ -210,6 +224,10 @@
 <main id="chat"><div class="inner" id="messages"></div></main>
 
 <footer>
+  <div class="savebar" id="savebar">
+    <span>未保存のメモ <b id="unsavedCount">0</b> 件</span>
+    <button type="button" class="btn primary" id="saveAll">メモアプリに一括保存</button>
+  </div>
   <div class="modebar">
     <span>読み取り形式</span>
     <div class="seg" role="group" aria-label="読み取り形式">
@@ -239,6 +257,16 @@
     <label>Gemini APIキー
       <input type="password" id="apiKey" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="AIza...">
       <small><a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> で無料で発行できます。キーはこの端末のブラウザにだけ保存され、GitHub には公開されません。</small>
+    </label>
+    <label>メモアプリへの保存方法
+      <select id="saveMethod">
+        <option value="shortcut">ショートカット経由（1枚 = 1メモ）</option>
+        <option value="share">共有シート（まとめて1つのメモ）</option>
+      </select>
+      <small>「ショートカット経由」は iPhone の「ショートカット」アプリに下記の名前のショートカットを作っておく必要があります（作り方は README 参照）。</small>
+    </label>
+    <label>ショートカット名
+      <input type="text" id="shortcutName" autocomplete="off" autocapitalize="off" spellcheck="false">
     </label>
     <label>モデル
       <input type="text" id="model" autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -278,7 +306,7 @@
     'これはクイズアプリのスクリーンショット（問題部分を切り出した画像）です。次の部分だけを読み取ってください。',
     '・question: オレンジ色の「Q」マークの右にある問題文。画面上の改行は取り除き、1つの文につなげてください。',
     '・answer: 赤い「A」マークの右にある赤い文字の正解。',
-    '・sub: 正解の下に灰色の小さな文字があれば、その文字（読みがなや別解）。なければ空文字。',
+    '・正解の下にある灰色の小さな文字（読みがな・別解）は読み取らないでください。',
     '・プレイヤー名、得点、タイマー、問題番号、キャラクター、メニューなどは無視してください。',
     '・文字は画像のとおり正確に書き写し、推測で補ったり言い換えたりしないでください。',
     '・この形式のクイズ画面でない場合は is_quiz を false にしてください。'
@@ -302,7 +330,7 @@
     }
   };
 
-  let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL, mode: 'quiz' }, storage.get(KEY_SETTINGS, {}));
+  let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL, mode: 'quiz', saveMethod: 'shortcut', shortcutName: 'スクショメモ保存' }, storage.get(KEY_SETTINGS, {}));
   let messages = storage.get(KEY_MESSAGES, []);
   if (!Array.isArray(messages)) messages = [];
   messages = messages.filter(m => !m.pending);
@@ -310,6 +338,7 @@
   let busy = 0;
 
   function saveMessages() {
+    updateSaveBar();
     const data = messages.filter(m => !m.pending).map(({ _job, ...rest }) => rest);
     if (storage.set(KEY_MESSAGES, data)) return;
     // 容量オーバー時は古いサムネイルから削る
@@ -428,6 +457,7 @@
             document.createTextNode(m.title || 'メモ'),
             m.quiz ? el('span', { class: 'tag', text: 'クイズ' }) : null,
             m.duplicate ? el('span', { class: 'tag dup', text: '重複' }) : null,
+            m.saved ? el('span', { class: 'tag saved', text: '保存済み' }) : null,
             el('span', { class: 'card-date', text: fmtDate(m.at) })
           ])
         ]),
@@ -449,7 +479,6 @@
     const a = el('div', { class: 'quiz-a' }, [
       el('span', { class: 'badge a', text: 'A' }),
       el('span', { class: 'quiz-answer', text: q.answer || '（読み取れませんでした）' }),
-      q.sub && q.sub !== q.answer ? el('span', { class: 'quiz-sub', text: q.sub }) : null
     ]);
     return el('div', { class: 'card-body expanded' }, [
       el('div', { class: 'quiz-q' }, [el('span', { class: 'badge q', text: 'Q' }), el('span', { text: q.question })]),
@@ -458,8 +487,7 @@
   }
 
   function formatQuiz(q) {
-    const sub = q.sub && q.sub !== q.answer ? `（${q.sub}）` : '';
-    return `Q. ${q.question}\nA. ${q.answer}${sub}`;
+    return `Q. ${q.question}\nA. ${q.answer}`;
   }
 
   const normalize = t => (t || '').replace(/[\s\u3000、。，．,.・「」『』？?！!]/g, '');
@@ -499,23 +527,52 @@
   }
 
   // ---------- コピー / 共有 ----------
-  async function copyText(text) {
+  async function copyText(text, silent) {
     try { await navigator.clipboard.writeText(text); }
     catch {
       const ta = el('textarea', { style: 'position:fixed;opacity:0' }); ta.value = text;
       document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
     }
-    toast('コピーしました');
+    if (!silent) toast('コピーしました');
   }
 
+  // 共有できたら true
   async function shareText(title, text) {
     const content = title ? `${title}\n\n${text}` : text;
     if (navigator.share) {
-      try { await navigator.share({ text: content }); } catch (e) { if (e.name !== 'AbortError') copyText(content); }
+      try { await navigator.share({ text: content }); return true; }
+      catch (e) { if (e.name !== 'AbortError') { copyText(content); return true; } return false; }
+    }
+    copyText(content);
+    return true;
+  }
+
+  // ---------- メモアプリへ一括保存 ----------
+  // ショートカット側でこの区切り文字で分割し、1件ずつ「メモを作成」する
+  const MEMO_SEPARATOR = '@@@@';
+
+  const unsavedMemos = () => messages.filter(m => m.kind === 'ocr' && m.text && !m.duplicate && !m.saved);
+
+  function updateSaveBar() {
+    const n = unsavedMemos().length;
+    $('unsavedCount').textContent = n;
+    $('savebar').classList.toggle('show', n > 0);
+  }
+
+  async function saveToNotes(list) {
+    if (!list.length) { toast('保存するメモがありません'); return; }
+    if (settings.saveMethod === 'shortcut') {
+      await copyText(list.map(m => m.text).join(MEMO_SEPARATOR), true);
+      list.forEach(m => { m.saved = true; });
+      saveMessages(); render();
+      location.href = 'shortcuts://run-shortcut?name=' + encodeURIComponent(settings.shortcutName) + '&input=clipboard';
     } else {
-      copyText(content);
+      const ok = await shareText('', list.map(m => m.text).join('\n\n'));
+      if (ok) { list.forEach(m => { m.saved = true; }); saveMessages(); render(); }
     }
   }
+
+  $('saveAll').addEventListener('click', () => saveToNotes(unsavedMemos()));
 
   $('exportAll').addEventListener('click', () => {
     const memos = messages.filter(m => m.kind === 'ocr' && m.text && !m.duplicate);
@@ -583,8 +640,9 @@
     }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      if ((res.status === 429 || res.status >= 500) && attempt < 2) {
-        await new Promise(r => setTimeout(r, (attempt + 1) * 4000));
+      if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+        // 無料枠は1分あたりの回数制限があるため、429 のときは長めに待って再試行
+        await new Promise(r => setTimeout(r, (res.status === 429 ? 15000 : 3000) * (attempt + 1)));
         return callGemini(body, attempt + 1);
       }
       const msg = data.error && data.error.message || `HTTP ${res.status}`;
@@ -649,10 +707,9 @@
           properties: {
             is_quiz: { type: 'BOOLEAN' },
             question: { type: 'STRING' },
-            answer: { type: 'STRING' },
-            sub: { type: 'STRING' }
+            answer: { type: 'STRING' }
           },
-          required: ['is_quiz', 'question', 'answer', 'sub']
+          required: ['is_quiz', 'question', 'answer']
         }
       }
     });
@@ -660,8 +717,7 @@
     try { j = JSON.parse(raw); } catch { return null; }
     const q = {
       question: String(j.question || '').replace(/\s*\n\s*/g, '').trim(),
-      answer: String(j.answer || '').trim(),
-      sub: String(j.sub || '').trim()
+      answer: String(j.answer || '').trim()
     };
     if (j.is_quiz === false || !q.question) return null;
     return q;
@@ -870,6 +926,8 @@
   function openSettings() {
     $('apiKey').value = settings.apiKey;
     $('model').value = settings.model || DEFAULT_MODEL;
+    $('saveMethod').value = settings.saveMethod;
+    $('shortcutName').value = settings.shortcutName;
     dlg.showModal();
   }
   $('openSettings').addEventListener('click', openSettings);
@@ -877,6 +935,8 @@
   $('settingsForm').addEventListener('submit', () => {
     settings.apiKey = $('apiKey').value.trim();
     settings.model = $('model').value.trim() || DEFAULT_MODEL;
+    settings.saveMethod = $('saveMethod').value;
+    settings.shortcutName = $('shortcutName').value.trim() || 'スクショメモ保存';
     storage.set(KEY_SETTINGS, settings);
     toast('保存しました');
     if (!messages.length) render();
@@ -898,6 +958,7 @@
   renderMode();
 
   render();
+  updateSaveBar();
   scrollToBottom();
   if (!settings.apiKey) setTimeout(openSettings, 300);
 })();
