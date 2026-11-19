@@ -165,6 +165,11 @@
   .savebar span { flex: 1; font-size: 14px; }
   .savebar b { color: var(--accent); }
   .tag.saved { background: #dcefdc; color: #2d6a2d; }
+  .pend.more {
+    width: 52px; height: 92px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2);
+    display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; color: var(--muted);
+  }
+  .savebar .btn[hidden] { display: none; }
   .dlg select {
     font: inherit; font-size: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
     background: var(--bg); color: var(--text); font-weight: 400;
@@ -225,6 +230,10 @@
 <main id="chat"><div class="inner" id="messages"></div></main>
 
 <footer>
+  <div class="savebar" id="statusbar">
+    <span id="statusText"></span>
+    <button type="button" class="btn" id="retryAll" hidden>まとめて再試行</button>
+  </div>
   <div class="savebar" id="savebar">
     <span>未保存のメモ <b id="unsavedCount">0</b> 件</span>
     <button type="button" class="btn primary" id="saveAll">メモアプリに一括保存</button>
@@ -296,6 +305,9 @@
   const KEY_SETTINGS = 'screenmemo.settings';
   const KEY_MESSAGES = 'screenmemo.messages';
   const CONCURRENCY = 2;
+  const MAX_PER_BATCH = 500;   // 1回に追加できる枚数（無料枠1日の上限の目安）
+  const PREVIEW = 20;          // 入力欄に並べるサムネイルの数
+  const DAILY_MSG = '今日の無料枠の上限に達しました。日本時間の夕方（16〜17時）以降に「まとめて再試行」を押してください。';
 
   const OCR_SYSTEM = [
     'あなたはスマートフォンのスクリーンショットを読み取り、メモとして保存できるテキストに変換するアシスタントです。',
@@ -416,6 +428,7 @@
       const wrap = el('div', { class: 'msg-user', 'data-id': m.id });
       if (m.thumbs && m.thumbs.length) {
         wrap.append(el('div', { class: 'thumbs' }, m.thumbs.map(src => el('img', { src, alt: 'スクリーンショット' }))));
+        if (m.imageCount > m.thumbs.length) wrap.append(el('div', { class: 'bubble', text: `🖼 全${m.imageCount}枚` }));
       } else if (m.imageCount) {
         wrap.append(el('div', { class: 'bubble', text: `🖼 スクリーンショット ${m.imageCount}枚` }));
       }
@@ -565,6 +578,7 @@
   const unsavedMemos = () => messages.filter(m => m.kind === 'ocr' && m.text && !m.duplicate && !m.saved);
 
   function updateSaveBar() {
+    updateStatus();
     const n = unsavedMemos().length;
     $('unsavedCount').textContent = n;
     $('savebar').classList.toggle('show', n > 0);
@@ -602,9 +616,10 @@
     }
     return await new Promise((resolve, reject) => {
       const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error('画像を読み込めませんでした'));
-      img.src = URL.createObjectURL(file);
+      const url = URL.createObjectURL(file);
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('画像を読み込めませんでした')); };
+      img.src = url;
     });
   }
 
@@ -670,6 +685,13 @@
     }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
+      if (res.status === 429) {
+        const delay = retryDelayMs(data);
+        if (/PerDay/i.test(JSON.stringify(data.error || {})) || delay > 120000) {
+          dailyLimitHit = true;
+          throw new Error(DAILY_MSG);
+        }
+      }
       if ((res.status === 429 || res.status >= 500) && attempt < 5) {
         // 回数制限(429)のときは API が指示する時間だけ待ち、他のリクエストも止める
         const wait = res.status === 429 ? (retryDelayMs(data) || 20000 * (attempt + 1)) : 3000 * (attempt + 1);
@@ -790,6 +812,7 @@
   function setBusy(delta) {
     busy += delta;
     updateSendState();
+    updateStatus();
   }
 
   function updateSendState() {
@@ -799,6 +822,12 @@
   async function runOcrJob(job) {
     const m = job.msg;
     try {
+      if (dailyLimitHit) throw new Error(DAILY_MSG);
+      if (!job.base64) {
+        const p = await prepareFile(job.file, job.mode);
+        Object.assign(job, { base64: p.base64, cropped: p.cropped });
+        m.thumb = p.thumb;
+      }
       let quiz = null;
       if (job.mode === 'quiz') {
         quiz = await ocrQuiz(job.base64, job.instruction);
@@ -821,10 +850,67 @@
     } catch (e) {
       Object.assign(m, { pending: false, kind: 'error', text: e.message, retry: { type: 'ocr' } });
       m._job = job; // 再試行用（保存はしない）
+    } finally {
+      job.base64 = null; // 大量処理でもメモリを使い切らないように
     }
     updateMessage(m);
     saveMessages();
   }
+
+  let dailyLimitHit = false;
+  const progress = { done: 0, total: 0 };
+
+  function updateStatus() {
+    const failed = messages.filter(m => m.kind === 'error' && m._job).length;
+    const bar = $('statusbar'), txt = $('statusText'), btn = $('retryAll');
+    if (progress.total && progress.done < progress.total) {
+      const left = progress.total - progress.done;
+      txt.textContent = `解析中 ${progress.done} / ${progress.total} 枚・残り約${Math.ceil(left / (Number(settings.rpm) || 10))}分`;
+      btn.hidden = true;
+      bar.classList.add('show');
+    } else if (failed && !busy) {
+      txt.textContent = `読み取れなかった画像 ${failed} 件`;
+      btn.hidden = false;
+      bar.classList.add('show');
+    } else {
+      bar.classList.remove('show');
+    }
+  }
+
+  // 画像ごとのカードは処理を始めたときに作る（数百枚でも画面が重くならないように）
+  async function processJobs(jobs) {
+    dailyLimitHit = false;
+    progress.done = 0; progress.total = jobs.length;
+    updateStatus();
+    keepAwake(true);
+    const rpm = Number(settings.rpm) || 10;
+    if (jobs.length > rpm) toast(`${jobs.length}枚：約${Math.ceil(jobs.length / rpm)}分かかります。画面を開いたままお待ちください`);
+    await runPool(jobs, async job => {
+      if (job.msg) {
+        Object.assign(job.msg, { pending: true, kind: 'ocr' });
+        updateMessage(job.msg);
+      } else {
+        job.msg = { id: uid(), role: 'model', kind: 'ocr', pending: true, thumb: job.thumb, at: Date.now() };
+        addMessage(job.msg);
+      }
+      await runOcrJob(job);
+      progress.done++;
+      updateStatus();
+    });
+    progress.total = 0;
+    const ok = jobs.filter(j => j.msg.kind === 'ocr').length;
+    const dup = jobs.filter(j => j.msg.duplicate).length;
+    if (dailyLimitHit) toast(`${ok}枚で今日の上限に達しました。残りは夕方以降に「まとめて再試行」してください`);
+    else if (jobs.length > 1) toast(`${ok} / ${jobs.length}枚をテキスト化しました` + (dup ? `（重複 ${dup}件）` : ''));
+    updateStatus();
+  }
+
+  $('retryAll').addEventListener('click', async () => {
+    const jobs = messages.filter(m => m.kind === 'error' && m._job).map(m => m._job);
+    if (!jobs.length || busy) return;
+    setBusy(1);
+    try { await processJobs(jobs); } finally { setBusy(-1); keepAwake(false); updateStatus(); }
+  });
 
   async function runPool(jobs, worker) {
     let i = 0;
@@ -858,32 +944,9 @@
 
     try {
       if (files.length) {
-        addMessage({ id: uid(), role: 'user', text, thumbs: files.map(f => f.thumb), imageCount: files.length, at: Date.now() });
-        const jobs = files.map(f => {
-          const msg = { id: uid(), role: 'model', kind: 'ocr', pending: true, thumb: f.thumb, at: Date.now() };
-          addMessage(msg);
-          return { msg, file: f.file, instruction: text, mode: settings.mode };
-        });
+        addMessage({ id: uid(), role: 'user', text, thumbs: files.slice(0, 12).map(f => f.thumb).filter(Boolean), imageCount: files.length, at: Date.now() });
         saveMessages();
-        keepAwake(true);
-        if (jobs.length > Number(settings.rpm || 10)) {
-          toast(`${jobs.length}枚：約${Math.ceil(jobs.length / Number(settings.rpm || 10))}分かかります。画面を開いたままお待ちください`);
-        }
-        await runPool(jobs, async job => {
-          try {
-            const p = await prepareFile(job.file, job.mode);
-            Object.assign(job, { base64: p.base64, cropped: p.cropped });
-            job.msg.thumb = p.thumb;
-          } catch (e) {
-            Object.assign(job.msg, { pending: false, kind: 'error', text: e.message });
-            updateMessage(job.msg); saveMessages();
-            return;
-          }
-          await runOcrJob(job);
-        });
-        const ok = jobs.filter(j => j.msg.kind === 'ocr').length;
-        const dup = jobs.filter(j => j.msg.duplicate).length;
-        if (jobs.length > 1) toast(`${ok} / ${jobs.length}枚をテキスト化しました` + (dup ? `（重複 ${dup}件）` : ''));
+        await processJobs(files.map(f => ({ file: f.file, thumb: f.thumb, instruction: text, mode: settings.mode })));
       } else {
         addMessage({ id: uid(), role: 'user', text, at: Date.now() });
         const msg = { id: uid(), role: 'model', kind: 'text', pending: true, at: Date.now() };
@@ -915,6 +978,7 @@
       toast('画像がもう手元にないため、もう一度スクショを送ってください');
       return;
     }
+    dailyLimitHit = false;
     setBusy(1);
     m.pending = true;
     m.kind = m.retry.type === 'ocr' ? 'ocr' : 'text';
@@ -941,29 +1005,50 @@
   sendEl.addEventListener('click', send);
   $('attach').addEventListener('click', () => fileEl.click());
 
-  fileEl.addEventListener('change', async () => {
-    const files = Array.from(fileEl.files || []);
+  fileEl.addEventListener('change', () => {
+    const all = Array.from(fileEl.files || []);
     fileEl.value = '';
-    for (const file of files) {
-      try {
-        const bmp = await loadBitmap(file);
-        const thumb = drawScaled(bmp, 180, 'image/jpeg', 0.6);
-        if (bmp.close) bmp.close();
-        pendingFiles.push({ id: uid(), file, thumb });
-      } catch {
-        toast(`${file.name} を読み込めませんでした`);
-      }
-    }
+    if (!all.length) { toast('画像を受け取れませんでした。枚数を減らして（500枚以下）選び直してください'); return; }
+    const room = MAX_PER_BATCH - pendingFiles.length;
+    if (room <= 0) { toast(`一度に追加できるのは${MAX_PER_BATCH}枚までです`); return; }
+    const take = all.slice(0, room);
+    pendingFiles.push(...take.map(file => ({ id: uid(), file, thumb: null })));
+    if (all.length > take.length) toast(`一度に追加できるのは${MAX_PER_BATCH}枚まで（1日の無料上限の目安）。${take.length}枚を追加しました`);
     renderPending();
   });
 
+  // サムネイルは画面に出す分だけ、1枚ずつ順番に作る
+  let thumbQueue = Promise.resolve();
+  function thumbLater(p, img) {
+    thumbQueue = thumbQueue.then(async () => {
+      if (!p.thumb) {
+        try {
+          const bmp = await loadBitmap(p.file);
+          p.thumb = drawScaled(bmp, 180, 'image/jpeg', 0.6);
+          if (bmp.close) bmp.close();
+        } catch { return; }
+      }
+      img.src = p.thumb;
+    });
+  }
+
   function renderPending() {
-    pendingEl.replaceChildren(...pendingFiles.map(p => el('div', { class: 'pend' }, [
-      el('img', { src: p.thumb, alt: '' }),
-      el('button', { type: 'button', 'aria-label': '取り消す', text: '×', onclick: () => {
-        pendingFiles = pendingFiles.filter(x => x.id !== p.id); renderPending();
-      } })
-    ])));
+    const nodes = pendingFiles.slice(0, PREVIEW).map(p => {
+      const img = el('img', { alt: '' });
+      if (p.thumb) img.src = p.thumb; else thumbLater(p, img);
+      return el('div', { class: 'pend' }, [
+        img,
+        el('button', { type: 'button', 'aria-label': '取り消す', text: '×', onclick: () => {
+          pendingFiles = pendingFiles.filter(x => x.id !== p.id); renderPending();
+        } })
+      ]);
+    });
+    if (pendingFiles.length > PREVIEW) {
+      nodes.push(el('div', { class: 'pend more', text: `+${pendingFiles.length - PREVIEW}枚`, role: 'button', onclick: () => {
+        if (confirm(`選択中の${pendingFiles.length}枚をすべて取り消しますか？`)) { pendingFiles = []; renderPending(); }
+      } }));
+    }
+    pendingEl.replaceChildren(...nodes);
     pendingEl.classList.toggle('show', pendingFiles.length > 0);
     inputEl.placeholder = pendingFiles.length
       ? `${pendingFiles.length}枚を送信（指示は任意）`
