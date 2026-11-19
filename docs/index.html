@@ -117,6 +117,7 @@
 
   .error { color: var(--danger); background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; font-size: 14px; }
   .loading { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; padding: 10px 12px; }
+  .dots { flex: none; white-space: nowrap; }
   .dots span { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 3px; animation: blink 1.2s infinite both; }
   .dots span:nth-child(2) { animation-delay: .2s; }
   .dots span:nth-child(3) { animation-delay: .4s; }
@@ -202,6 +203,9 @@
   }
   .dlg small { color: var(--muted); font-weight: 400; font-size: 12px; line-height: 1.5; }
   .dlg a { color: var(--accent); }
+  .bgbox { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg); }
+  .bgbox b { font-size: 14px; }
+  .bgbox .btn { align-self: flex-start; font-size: 14px; padding: 7px 12px; }
   .dlg-buttons { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
   .btn { border: 1px solid var(--border); background: transparent; padding: 9px 16px; border-radius: 10px; font-size: 15px; }
   .btn.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
@@ -274,11 +278,20 @@
         <option value="share">共有シート（まとめて1つのメモ）</option>
       </select>
       <small>「ショートカット経由」は iPhone の「ショートカット」アプリに下記の名前のショートカットを作っておく必要があります（作り方は README 参照）。</small>
-      <small>アプリを開かずに夜中に自動で処理したい場合は → <a href="shortcut.html">バックグラウンド自動処理の作り方</a></small>
     </label>
     <label>ショートカット名
       <input type="text" id="shortcutName" autocomplete="off" autocapitalize="off" spellcheck="false">
     </label>
+    <div class="bgbox">
+      <b>バックグラウンド解析（アプリを閉じても解析）</b>
+      <small>自分の Google アカウントに無料の解析サーバーを作ると、送信後にアプリを閉じても解析が続きます。<a href="server.html">作り方</a></small>
+      <button type="button" class="btn" id="bgCopy">① サーバー用コードをコピー</button>
+      <label>② サーバーの URL
+        <input type="url" id="bgUrl" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://script.google.com/macros/s/…/exec">
+      </label>
+      <button type="button" class="btn" id="bgTest">③ 接続テスト</button>
+      <small id="bgState"></small>
+    </div>
     <label>1分あたりの解析枚数の上限
       <input type="number" id="rpm" inputmode="numeric" min="1" max="1000">
       <small>無料枠は 10 のままがおすすめ（超えるとエラーになります）。有料プランなら 60 などに上げると速くなります。</small>
@@ -349,7 +362,7 @@
     }
   };
 
-  let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL, mode: 'quiz', rpm: 10, saveMethod: 'shortcut', shortcutName: 'スクショメモ保存' }, storage.get(KEY_SETTINGS, {}));
+  let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL, mode: 'quiz', rpm: 10, bgUrl: '', bgToken: '', saveMethod: 'shortcut', shortcutName: 'スクショメモ保存' }, storage.get(KEY_SETTINGS, {}));
   let messages = storage.get(KEY_MESSAGES, []);
   if (!Array.isArray(messages)) messages = [];
   messages = messages.filter(m => !m.pending);
@@ -438,6 +451,17 @@
     }
 
     const wrap = el('div', { class: 'msg-model', 'data-id': m.id });
+    if (m.kind === 'remote') {
+      const dots = el('span', { class: 'dots' }); dots.innerHTML = '<span></span><span></span><span></span>';
+      wrap.append(el('div', { class: 'card' }, [
+        el('div', { class: 'card-head' }, [
+          m.thumb ? el('img', { src: m.thumb, alt: '' }) : null,
+          el('div', { class: 'loading', style: 'flex:1;padding:0' }, [dots, el('span', { text: 'サーバーで解析待ち（アプリを閉じても続きます）' })]),
+          chip('trash', '取消', () => { callServer('cancel', { ids: [m.id] }).catch(() => {}); removeMessage(m.id); })
+        ])
+      ]));
+      return wrap;
+    }
     if (m.pending) {
       const dots = el('span', { class: 'dots' }); dots.innerHTML = '<span></span><span></span><span></span>';
       wrap.append(el('div', { class: m.kind === 'ocr' ? 'card' : '' }, [
@@ -458,7 +482,7 @@
       return wrap;
     }
     if (m.kind === 'ocr') {
-      const body = m.quiz ? renderQuizBody(m.quiz) : el('div', { class: 'card-body', text: m.text || '（文字が見つかりませんでした）' });
+      const body = m.quiz ? renderQuizBody(m.quiz) : el('div', { class: 'card-body', text: m.text || (m.skip ? '（クイズ画面ではなかったため、メモにしません）' : '（文字が見つかりませんでした）') });
       const actions = el('div', { class: 'card-actions' }, [
         chip('share', '共有', async () => {
           if (await shareText(m.quiz ? '' : m.title, m.text)) { m.saved = true; saveMessages(); updateMessage(m); }
@@ -644,7 +668,7 @@
   async function prepareFile(file, mode) {
     const bmp = await loadBitmap(file);
     const crop = mode === 'quiz' && bmp.height / bmp.width > 1.6 ? QUIZ_CROP : null;
-    const thumb = drawScaled(bmp, 180, 'image/jpeg', 0.6, crop);
+    const thumb = drawScaled(bmp, 140, 'image/jpeg', 0.55, crop);
     // 縦長のスクショでも文字が潰れないよう長辺 3072px まで
     const full = drawScaled(bmp, 3072, 'image/jpeg', 0.88, crop);
     if (bmp.close) bmp.close();
@@ -707,6 +731,11 @@
       if (res.status === 429) throw new Error('利用上限に達しました（無料枠は1日の回数にも上限があります）。時間をおいて「再試行」を押してください。');
       throw new Error(msg);
     }
+    return extractText(data);
+  }
+
+  // Gemini の応答 JSON から文字を取り出す（アプリ内でもサーバー経由でも共通）
+  function extractText(data) {
     const cand = data.candidates && data.candidates[0];
     const text = cand && cand.content && (cand.content.parts || []).map(p => p.text || '').join('') || '';
     if (!text) {
@@ -716,8 +745,8 @@
     return text;
   }
 
-  async function ocr(base64, instruction) {
-    const raw = await callGemini({
+  function generalBody(base64, instruction) {
+    return {
       systemInstruction: { parts: [{ text: OCR_SYSTEM }] },
       contents: [{
         role: 'user',
@@ -735,17 +764,11 @@
           required: ['title', 'text']
         }
       }
-    });
-    try {
-      const j = JSON.parse(raw);
-      return { title: String(j.title || '').trim(), text: String(j.text || '').trim() };
-    } catch {
-      return { title: '', text: raw.trim() };
-    }
+    };
   }
 
-  async function ocrQuiz(base64, instruction) {
-    const raw = await callGemini({
+  function quizBody(base64, instruction) {
+    return {
       systemInstruction: { parts: [{ text: QUIZ_SYSTEM }] },
       contents: [{
         role: 'user',
@@ -767,7 +790,20 @@
           required: ['is_quiz', 'question', 'answer']
         }
       }
-    });
+    };
+  }
+
+  function parseGeneral(raw) {
+    try {
+      const j = JSON.parse(raw);
+      return { title: String(j.title || '').trim(), text: String(j.text || '').trim() };
+    } catch {
+      return { title: '', text: raw.trim() };
+    }
+  }
+
+  // クイズ画面でなければ null
+  function parseQuiz(raw) {
     let j;
     try { j = JSON.parse(raw); } catch { return null; }
     const q = {
@@ -777,6 +813,9 @@
     if (j.is_quiz === false || !q.question) return null;
     return q;
   }
+
+  const ocr = async (base64, instruction) => parseGeneral(await callGemini(generalBody(base64, instruction)));
+  const ocrQuiz = async (base64, instruction) => parseQuiz(await callGemini(quizBody(base64, instruction)));
 
   function buildHistory(upto) {
     const recent = messages.slice(0, upto).filter(m => !m.pending && m.kind !== 'error').slice(-30);
@@ -861,17 +900,185 @@
   let dailyLimitHit = false;
   const progress = { done: 0, total: 0 };
 
+  // ---------- バックグラウンド解析サーバー（利用者の Google Apps Script） ----------
+  // 本文を text/plain で送ると事前確認（CORS プリフライト）が不要になり、Apps Script でも受け取れる
+  if (!settings.bgToken) {
+    settings.bgToken = (crypto.randomUUID ? crypto.randomUUID() : uid() + uid() + uid()).replace(/-/g, '');
+    storage.set(KEY_SETTINGS, settings);
+  }
+  let serverInfo = null;   // サーバーの件数・上限の情報
+  let serverError = '';
+  let uploading = false;
+
+  async function callServer(action, payload = {}) {
+    if (!settings.bgUrl) throw new Error('サーバーの URL が未設定です');
+    const controller = new AbortController();
+    const timer = action === 'kick' ? null : setTimeout(() => controller.abort(), 90000);
+    let res;
+    try {
+      res = await fetch(settings.bgUrl, {
+        method: 'POST',
+        body: JSON.stringify({
+          action, token: settings.bgToken,
+          ...(action === 'enqueue' ? { appUrl: location.origin + location.pathname } : {}),
+          ...payload
+        }),
+        redirect: 'follow',
+        signal: controller.signal
+      });
+    } catch {
+      throw new Error(controller.signal.aborted ? 'サーバーの応答がありませんでした（時間切れ）' : 'サーバーに接続できませんでした（URL と電波状況を確認してください）');
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); }
+    catch {
+      throw new Error(/<html/i.test(text)
+        ? 'サーバーの応答がウェブページでした。デプロイの「アクセスできるユーザー」が「全員」か確認してください'
+        : `サーバーの応答を読み取れませんでした（${res.status}）`);
+    }
+    if (!json.ok) throw new Error(json.error || 'サーバーでエラーが発生しました');
+    return json;
+  }
+
+  // 画像を準備してサーバーに預ける（8枚ずつまとめて送る）。送り終われば閉じてよい
+  async function sendRemote(files, instruction) {
+    uploading = true;
+    progress.done = 0; progress.total = files.length;
+    updateStatus();
+    keepAwake(true);
+    const model = (settings.model || DEFAULT_MODEL).trim().replace(/^models\//, '');
+    let sent = 0, failed = 0;
+    for (let i = 0; i < files.length; i += 8) {
+      const group = [];
+      for (const f of files.slice(i, i + 8)) {
+        try {
+          const p = await prepareFile(f.file, settings.mode);
+          const id = uid();
+          group.push({
+            msg: { id, role: 'model', kind: 'remote', mode: settings.mode, thumb: p.thumb, at: Date.now() },
+            job: { id, model, body: settings.mode === 'quiz' ? quizBody(p.base64, instruction) : generalBody(p.base64, instruction) }
+          });
+        } catch { failed++; }
+      }
+      let ok = false, lastErr;
+      for (let attempt = 0; attempt < 3 && !ok && group.length; attempt++) {
+        try { await callServer('enqueue', { jobs: group.map(g => g.job) }); ok = true; }
+        catch (e) { lastErr = e; await sleep(2000 * (attempt + 1)); }
+      }
+      if (ok) {
+        group.forEach(g => addMessage(g.msg));
+        sent += group.length;
+        saveMessages();
+      } else if (group.length) {
+        failed += group.length;
+        addMessage({ id: uid(), role: 'model', kind: 'error', text: `${group.length}枚をサーバーに送れませんでした：${lastErr.message}（もう一度選んで送ってください）`, at: Date.now() });
+      }
+      progress.done = Math.min(files.length, i + 8);
+      updateStatus();
+    }
+    progress.total = 0;
+    uploading = false;
+    keepAwake(false);
+    if (sent) {
+      toast(`${sent}枚をサーバーに預けました。アプリを閉じても解析が続きます`);
+      callServer('kick').catch(() => {});   // 1分ごとの起動を待たずに解析を始めてもらう
+      setTimeout(pollRemote, 60000);
+    }
+    if (failed && !sent) toast('サーバーに送れませんでした');
+    updateStatus();
+  }
+
+  // サーバーの結果を取り込む
+  function applyRemoteResult(res) {
+    let m = messages.find(x => x.id === res.id);
+    if (!m) { m = { id: res.id, role: 'model', at: Date.now() }; messages.push(m); }
+    const mode = m.mode || 'quiz';
+    delete m.pending;
+    try {
+      if (!res.ok) {
+        const reason = res.status === 400 ? '要求が正しくありませんでした' : `HTTP ${res.status}`;
+        throw new Error(`サーバーでの解析に失敗しました（${reason}）。もう一度スクショを送ってください`);
+      }
+      const raw = extractText(JSON.parse(res.body));
+      if (mode === 'quiz') {
+        const quiz = parseQuiz(raw);
+        if (quiz) {
+          Object.assign(m, { kind: 'ocr', quiz, title: quiz.answer || 'クイズ', text: formatQuiz(quiz) });
+          m.duplicate = isDuplicateQuiz(quiz, m);
+        } else {
+          Object.assign(m, { kind: 'ocr', title: 'クイズ以外', text: '', skip: true });
+        }
+      } else {
+        const r = parseGeneral(raw);
+        Object.assign(m, { kind: 'ocr', title: r.title, text: r.text });
+      }
+    } catch (e) {
+      Object.assign(m, { kind: 'error', text: e.message });
+    }
+  }
+
+  let polling = false;
+  async function pollRemote() {
+    if (!settings.bgUrl || polling) return;
+    polling = true;
+    let got = 0;
+    try {
+      for (let round = 0; round < 20; round++) {
+        const r = await callServer('results', { limit: 50 });
+        serverInfo = r; serverError = '';
+        const results = r.results || [];
+        if (!results.length) break;
+        results.forEach(applyRemoteResult);
+        got += results.length;
+        saveMessages();
+        render();
+        await callServer('ack', { ids: results.map(x => x.id) });
+        if (results.length < 50) break;
+      }
+      if (got) { toast(`サーバーから ${got} 件の結果を受け取りました`); scrollToBottom(); }
+    } catch (e) {
+      serverError = e.message;
+    } finally {
+      polling = false;
+      updateStatus();
+    }
+  }
+  const remoteWaiting = () => messages.filter(m => m.kind === 'remote').length;
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pollRemote(); });
+  setInterval(() => {
+    if (document.visibilityState === 'visible' && (remoteWaiting() || (serverInfo && serverInfo.ready))) pollRemote();
+  }, 30000);
+
+  let statusAction = null;
+
   function updateStatus() {
     const failed = messages.filter(m => m.kind === 'error' && m._job).length;
     const bar = $('statusbar'), txt = $('statusText'), btn = $('retryAll');
-    if (progress.total && progress.done < progress.total) {
+    const waiting = remoteWaiting();
+    if (uploading && progress.total) {
+      txt.textContent = `サーバーへ送信中 ${progress.done} / ${progress.total} 枚（送り終わるまで開いたままに）`;
+      btn.hidden = true;
+      bar.classList.add('show');
+    } else if (progress.total && progress.done < progress.total) {
       const left = progress.total - progress.done;
       txt.textContent = `解析中 ${progress.done} / ${progress.total} 枚・残り約${Math.ceil(left / (Number(settings.rpm) || 10))}分`;
       btn.hidden = true;
       bar.classList.add('show');
     } else if (failed && !busy) {
       txt.textContent = `読み取れなかった画像 ${failed} 件`;
+      btn.textContent = 'まとめて再試行'; statusAction = 'retry';
       btn.hidden = false;
+      bar.classList.add('show');
+    } else if (waiting) {
+      const lim = serverInfo && serverInfo.limit;
+      txt.textContent = serverError ? `サーバーに接続できません：${serverError}`
+        : lim && lim.daily ? `サーバーで解析待ち ${waiting}件・今日の無料枠の上限のため夕方（16〜17時）に自動で再開`
+        : `サーバーで解析中 ${waiting}件・約${Math.ceil(waiting / 10)}分（アプリを閉じても続きます）`;
+      btn.textContent = '結果を確認'; statusAction = 'poll';
+      btn.hidden = polling;
       bar.classList.add('show');
     } else {
       bar.classList.remove('show');
@@ -907,6 +1114,7 @@
   }
 
   $('retryAll').addEventListener('click', async () => {
+    if (statusAction === 'poll') { pollRemote(); return; }
     const jobs = messages.filter(m => m.kind === 'error' && m._job).map(m => m._job);
     if (!jobs.length || busy) return;
     setBusy(1);
@@ -947,7 +1155,8 @@
       if (files.length) {
         addMessage({ id: uid(), role: 'user', text, thumbs: files.slice(0, 12).map(f => f.thumb).filter(Boolean), imageCount: files.length, at: Date.now() });
         saveMessages();
-        await processJobs(files.map(f => ({ file: f.file, thumb: f.thumb, instruction: text, mode: settings.mode })));
+        if (settings.bgUrl) await sendRemote(files, text);
+        else await processJobs(files.map(f => ({ file: f.file, thumb: f.thumb, instruction: text, mode: settings.mode })));
       } else {
         addMessage({ id: uid(), role: 'user', text, at: Date.now() });
         const msg = { id: uid(), role: 'model', kind: 'text', pending: true, at: Date.now() };
@@ -1064,6 +1273,8 @@
     $('saveMethod').value = settings.saveMethod;
     $('shortcutName').value = settings.shortcutName;
     $('rpm').value = settings.rpm;
+    $('bgUrl').value = settings.bgUrl;
+    $('bgState').textContent = settings.bgUrl ? '接続先が設定されています（送信はサーバー経由になります）' : '未設定（送信はこの画面の中で解析します）';
     dlg.showModal();
   }
   $('openSettings').addEventListener('click', openSettings);
@@ -1074,9 +1285,39 @@
     settings.saveMethod = $('saveMethod').value;
     settings.shortcutName = $('shortcutName').value.trim() || 'スクショメモ保存';
     settings.rpm = Math.min(1000, Math.max(1, parseInt($('rpm').value, 10) || 10));
+    settings.bgUrl = $('bgUrl').value.trim();
+    // APIキーを変えたときは、サーバーにも新しいキーを登録する
+    if (settings.bgUrl && settings.apiKey) callServer('config', { geminiKey: settings.apiKey }).catch(() => {});
     storage.set(KEY_SETTINGS, settings);
     toast('保存しました');
     if (!messages.length) render();
+  });
+  // サーバー用コード（同じ場所に置いた apps-script.txt）を先に読んでおき、ボタンで即コピーできるようにする
+  let serverCode = '';
+  fetch('apps-script.txt').then(r => r.ok ? r.text() : '').then(t => { serverCode = t; }).catch(() => {});
+  $('bgCopy').addEventListener('click', async () => {
+    if (!serverCode) { toast('コードを読み込めませんでした。電波を確認してもう一度押してください'); return; }
+    await copyText(serverCode, true);
+    toast('サーバー用コードをコピーしました');
+  });
+  $('bgTest').addEventListener('click', async () => {
+    const url = $('bgUrl').value.trim();
+    const key = $('apiKey').value.trim();
+    if (!/^https:\/\/script\.google\.com\/macros\/s\//.test(url)) { $('bgState').textContent = 'URL が正しくありません（https://script.google.com/macros/s/…/exec の形です）'; return; }
+    if (!key) { $('bgState').textContent = '先に Gemini APIキーを入力してください'; return; }
+    $('bgState').textContent = '接続しています…（最大1分ほど）';
+    const prevUrl = settings.bgUrl;
+    settings.bgUrl = url;
+    try {
+      const r = await callServer('config', { geminiKey: key });
+      settings.apiKey = key;
+      storage.set(KEY_SETTINGS, settings);
+      $('bgState').textContent = `✓ 接続できました（サーバーで解析待ち ${r.pending || 0}件・受け取り待ち ${r.ready || 0}件）。以後の送信はサーバー経由になります`;
+      pollRemote();
+    } catch (e) {
+      settings.bgUrl = prevUrl;
+      $('bgState').textContent = '✗ ' + e.message;
+    }
   });
   $('unsaveAll').addEventListener('click', () => {
     const list = messages.filter(m => m.saved);
@@ -1103,6 +1344,7 @@
   render();
   updateSaveBar();
   scrollToBottom();
+  pollRemote();
   if (!settings.apiKey) setTimeout(openSettings, 300);
 })();
 </script>

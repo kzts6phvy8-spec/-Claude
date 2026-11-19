@@ -1,0 +1,376 @@
+/**
+ * スクショメモ — バックグラウンド解析サーバー (Google Apps Script)
+ *
+ * iPhone のアプリを閉じている間も、Google のサーバー上でスクリーンショットを解析します。
+ * - アプリから送られた解析依頼 (画像入り) を Google ドライブの「スクショメモ_解析キュー」フォルダに置く
+ * - 1 分ごとに起動して Gemini API に送り、結果を同じフォルダに保存する
+ * - アプリを開くと結果を受け取り、受け取った結果は削除する
+ * - 送った分の解析が全部終わった時と、無料枠の 1 日の上限に達した時に、Google アカウントのメールに知らせる
+ *
+ * 指示文・モデルはアプリ側から毎回送られるので、このコードを更新する必要はありません。
+ * Gemini の API キーと合言葉は、アプリの「接続テスト」で自動的に登録されます。
+ */
+
+const VERSION = 1;
+const FOLDER_NAME = "スクショメモ_解析キュー";
+const BATCH = 5; // 1 回にまとめて Gemini へ送る枚数
+const PER_MINUTE = 10; // 1 分あたりに送る最大枚数 (無料枠の 1 分の上限を超えないように)
+const MAX_RUN_MS = 4.5 * 60 * 1000; // 1 回の起動で使う最大時間 (上限 6 分)
+const MAX_ATTEMPTS = 3; // サーバーエラー時の再試行回数
+const DRIVE_TRIES = 3; // Google ドライブが一時的にエラーを返した時のやり直し回数
+
+// ---------------- アプリからの呼び出し ----------------
+
+function doGet() {
+  return json({ ok: true, app: "screenmemo-bg", version: VERSION });
+}
+
+function doPost(e) {
+  try {
+    const req = JSON.parse(e.postData.contents);
+    const props = PropertiesService.getScriptProperties();
+
+    // 最初に接続したアプリの合言葉を登録し、以後は一致する時だけ受け付ける
+    const saved = props.getProperty("TOKEN");
+    if (!req.token || String(req.token).length < 16) return json({ ok: false, error: "合言葉がありません" });
+    if (!saved) {
+      if (req.action !== "config") return json({ ok: false, error: "先にアプリで接続テストをしてください" });
+      props.setProperty("TOKEN", req.token);
+    } else if (saved !== req.token) {
+      return json({ ok: false, error: "合言葉が一致しません (別の端末から登録済みです)" });
+    }
+
+    switch (req.action) {
+      case "config":
+        if (req.geminiKey) props.setProperty("GEMINI_KEY", req.geminiKey);
+        ensureTrigger();
+        return json({ ok: true, version: VERSION, ...counts() });
+      case "enqueue":
+        if (req.appUrl) props.setProperty("APP_URL", String(req.appUrl).slice(0, 500));
+        return json(enqueue(req.jobs || []));
+      case "results":
+        return json({ ok: true, version: VERSION, results: takeResults(req.limit || 50), ...counts() });
+      case "ack":
+        trashByIds(req.ids || [], "result_");
+        return json({ ok: true });
+      case "cancel":
+        trashByIds(req.ids || [], "job_");
+        return json({ ok: true });
+      case "status":
+        return json({ ok: true, version: VERSION, ...counts() });
+      case "kick":
+        // アプリからの「すぐ解析を始めて」の合図。1 分ごとの自動起動を待たずに解析する
+        processQueue();
+        return json({ ok: true, version: VERSION, ...counts() });
+      default:
+        return json({ ok: false, error: "不明な操作です: " + req.action });
+    }
+  } catch (err) {
+    const message = String(err && err.message ? err.message : err);
+    return json({
+      ok: false,
+      error: /ドライブ|Drive/i.test(message) ? "Google ドライブが一時的に使えません。少し待ってからもう一度お試しください (" + message + ")" : message,
+    });
+  }
+}
+
+function enqueue(jobs) {
+  const folder = getFolder();
+  let added = 0;
+  jobs.forEach(function (job) {
+    if (!job || !job.id || !job.model || !job.body) return;
+    const name = "job_" + job.id + ".json";
+    const exists = retry(function () {
+      return folder.getFilesByName(name).hasNext();
+    });
+    if (exists) return;
+    const content = JSON.stringify({ id: job.id, model: job.model, body: job.body, attempts: 0 });
+    retry(function () {
+      folder.createFile(name, content, "application/json");
+    });
+    added++;
+  });
+  if (added) PropertiesService.getScriptProperties().setProperty("NOTIFY_DONE", "1");
+  return { ok: true, added: added };
+}
+
+function takeResults(limit) {
+  const out = [];
+  listFiles(getFolder(), "result_", limit).forEach(function (f) {
+    try {
+      out.push(JSON.parse(retry(function () {
+        return f.getBlob().getDataAsString();
+      })));
+    } catch (err) {
+      if (!isDriveError(err)) f.setTrashed(true); // 壊れた結果は捨てる
+    }
+  });
+  return out;
+}
+
+function trashByIds(ids, prefix) {
+  const folder = getFolder();
+  ids.forEach(function (id) {
+    retry(function () {
+      const it = folder.getFilesByName(prefix + id + ".json");
+      while (it.hasNext()) it.next().setTrashed(true);
+    });
+  });
+}
+
+function counts() {
+  const props = PropertiesService.getScriptProperties();
+  let pending;
+  let ready;
+  try {
+    const c = countFiles(getFolder());
+    pending = c.pending;
+    ready = c.ready;
+    props.setProperty("LAST_COUNTS", JSON.stringify({ pending: pending, ready: ready }));
+  } catch (err) {
+    const last = JSON.parse(props.getProperty("LAST_COUNTS") || '{"pending":0,"ready":0}');
+    pending = last.pending;
+    ready = last.ready;
+  }
+  const limit = props.getProperty("LAST_LIMIT");
+  const lastError = props.getProperty("LAST_ERROR");
+  return {
+    pending: pending,
+    ready: ready,
+    lastRunAt: Number(props.getProperty("LAST_RUN") || 0),
+    lastOkAt: Number(props.getProperty("LAST_OK") || 0),
+    limit: limit ? JSON.parse(limit) : null,
+    lastError: lastError ? JSON.parse(lastError) : null,
+  };
+}
+
+// ---------------- 1 分ごとの解析 ----------------
+
+function processQueue() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return; // 前回の処理がまだ動いている
+  const props = PropertiesService.getScriptProperties();
+  try {
+    const key = props.getProperty("GEMINI_KEY");
+    if (!key) return;
+    // 1 日の上限に達した直後は、しばらく問い合わせない (実行時間の節約)
+    const limit = JSON.parse(props.getProperty("LAST_LIMIT") || "null");
+    if (limit && limit.daily && Date.now() - limit.at < 30 * 60 * 1000) return;
+
+    const started = Date.now();
+    const folder = getFolder();
+    const handled = {};
+    const gap = Math.ceil((60 * 1000 * BATCH) / PER_MINUTE); // BATCH 枚ごとに空ける時間
+    while (Date.now() - started < MAX_RUN_MS) {
+      const batchStarted = Date.now();
+      const jobs = [];
+      listFiles(folder, "job_", BATCH * 2).forEach(function (f) {
+        if (jobs.length >= BATCH || handled[f.getName()]) return;
+        handled[f.getName()] = true;
+        try {
+          jobs.push({ file: f, job: JSON.parse(retry(function () {
+            return f.getBlob().getDataAsString();
+          })) });
+        } catch (err) {
+          if (isDriveError(err)) throw err;
+          f.setTrashed(true); // 壊れた依頼は捨てる
+        }
+      });
+      if (jobs.length === 0) {
+        notifyDone(props, folder);
+        return;
+      }
+      props.setProperty("LAST_RUN", String(Date.now()));
+
+      const responses = UrlFetchApp.fetchAll(
+        jobs.map(function (j) {
+          return {
+            url: "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(j.job.model) + ":generateContent",
+            method: "post",
+            contentType: "application/json",
+            headers: { "x-goog-api-key": key },
+            payload: JSON.stringify(j.job.body),
+            muteHttpExceptions: true,
+          };
+        }),
+      );
+
+      let rateLimited = false;
+      responses.forEach(function (res, i) {
+        const j = jobs[i];
+        const code = res.getResponseCode();
+        const text = res.getContentText();
+        if (code === 200) {
+          props.setProperty("LAST_OK", String(Date.now()));
+          props.deleteProperty("LAST_LIMIT");
+          return finish(folder, j, { id: j.job.id, ok: true, status: code, body: text });
+        }
+        if (code === 429) {
+          rateLimited = true; // 上限: 依頼はそのまま残し、次の起動で再挑戦
+          props.setProperty(
+            "LAST_LIMIT",
+            JSON.stringify({ at: Date.now(), daily: /per.?day|PerDay|daily/i.test(text), message: text.slice(0, 500) }),
+          );
+          return;
+        }
+        if (code >= 500 && (j.job.attempts || 0) + 1 < MAX_ATTEMPTS) {
+          j.job.attempts = (j.job.attempts || 0) + 1;
+          retry(function () {
+            j.file.setContent(JSON.stringify(j.job));
+          });
+          return;
+        }
+        finish(folder, j, { id: j.job.id, ok: false, status: code, error: text.slice(0, 2000) });
+      });
+      props.deleteProperty("LAST_ERROR");
+      if (rateLimited) {
+        notifyLimit(props, folder);
+        return;
+      }
+      // 1 分あたりの枚数を超えないように待つ
+      const wait = gap - (Date.now() - batchStarted);
+      if (wait > 0) {
+        if (Date.now() - started + wait >= MAX_RUN_MS) return;
+        Utilities.sleep(wait);
+      }
+    }
+  } catch (err) {
+    props.setProperty("LAST_ERROR", JSON.stringify({ at: Date.now(), message: String(err && err.message ? err.message : err).slice(0, 300) }));
+    Logger.log("解析を中断しました (次の起動で再開します): " + err);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------------- メールでの知らせ ----------------
+
+function sendNotice(props, subject, lines) {
+  try {
+    const to = Session.getEffectiveUser().getEmail();
+    if (!to) return;
+    const url = props.getProperty("APP_URL");
+    MailApp.sendEmail(to, "【スクショメモ】" + subject, lines.concat(url ? ["", "アプリを開く: " + url] : []).join("\n"));
+  } catch (err) {
+    Logger.log("知らせのメールを送れませんでした: " + err);
+  }
+}
+
+/** 送られた分の解析が全部終わった: 1 回だけ知らせる */
+function notifyDone(props, folder) {
+  if (!props.getProperty("NOTIFY_DONE")) return;
+  props.deleteProperty("NOTIFY_DONE");
+  const ready = countFiles(folder).ready;
+  if (ready === 0) return; // もうアプリが受け取った
+  sendNotice(props, "解析が終わりました (" + ready + " 件)", [
+    "送ったスクリーンショットの解析が、サーバーですべて終わりました。",
+    "アプリを開くと結果を受け取ります。「メモアプリに一括保存」でメモに保存してください。",
+  ]);
+}
+
+/** 無料枠の 1 日の上限に達した: その日のうちは 1 回だけ知らせる */
+function notifyLimit(props, folder) {
+  const limit = JSON.parse(props.getProperty("LAST_LIMIT") || "null");
+  if (!limit || !limit.daily) return;
+  const today = Utilities.formatDate(new Date(), "America/Los_Angeles", "yyyy-MM-dd");
+  if (props.getProperty("LIMIT_MAILED") === today) return;
+  props.setProperty("LIMIT_MAILED", today);
+  const c = countFiles(folder);
+  sendNotice(props, "今日の無料枠の上限に達しました", [
+    "Gemini の無料枠の 1 日の上限に達したので、解析を休んでいます (残り " + c.pending + " 件)。",
+    "上限が戻ると (日本時間の 16〜17 時ごろ)、サーバーが自動で続きを解析します。アプリは閉じたままで大丈夫です。",
+    c.ready > 0 ? "解析済みの " + c.ready + " 件は、アプリを開くと受け取れます。" : "",
+  ]);
+}
+
+function finish(folder, j, result) {
+  retry(function () {
+    folder.createFile("result_" + j.job.id + ".json", JSON.stringify(result), "application/json");
+  });
+  retry(function () {
+    j.file.setTrashed(true);
+  });
+}
+
+// ---------------- 補助 ----------------
+
+function retry(fn) {
+  let lastErr;
+  for (let i = 0; i < DRIVE_TRIES; i++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastErr = err;
+      if (i < DRIVE_TRIES - 1) Utilities.sleep(500 * Math.pow(3, i));
+    }
+  }
+  throw lastErr;
+}
+
+function isDriveError(err) {
+  return /ドライブ|Drive|サービス エラー|Service error/i.test(String(err && err.message ? err.message : err));
+}
+
+function listFiles(folder, prefix, limit) {
+  return retry(function () {
+    const out = [];
+    const it = folder.getFiles();
+    while (it.hasNext() && out.length < limit) {
+      const f = it.next();
+      if (f.getName().indexOf(prefix) === 0) out.push(f);
+    }
+    return out;
+  });
+}
+
+function countFiles(folder) {
+  return retry(function () {
+    let pending = 0;
+    let ready = 0;
+    const it = folder.getFiles();
+    while (it.hasNext()) {
+      const n = it.next().getName();
+      if (n.indexOf("job_") === 0) pending++;
+      else if (n.indexOf("result_") === 0) ready++;
+    }
+    return { pending: pending, ready: ready };
+  });
+}
+
+function ensureTrigger() {
+  const exists = ScriptApp.getProjectTriggers().some(function (t) {
+    return t.getHandlerFunction() === "processQueue";
+  });
+  if (!exists) ScriptApp.newTrigger("processQueue").timeBased().everyMinutes(1).create();
+}
+
+function getFolder() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty("FOLDER_ID");
+  if (id) {
+    try {
+      return retry(function () {
+        return DriveApp.getFolderById(id);
+      });
+    } catch (err) {
+      if (isDriveError(err) && !/not found|見つかりません/i.test(String(err))) throw err;
+    }
+  }
+  const folder = retry(function () {
+    const it = DriveApp.getFoldersByName(FOLDER_NAME);
+    return it.hasNext() ? it.next() : DriveApp.createFolder(FOLDER_NAME);
+  });
+  props.setProperty("FOLDER_ID", folder.getId());
+  return folder;
+}
+
+function json(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/** 最初に 1 回だけエディタから実行して、ドライブなどへのアクセスを許可するための関数 */
+function setup() {
+  getFolder();
+  ensureTrigger();
+  Logger.log("知らせのメールの送り先: " + Session.getEffectiveUser().getEmail() + " (今日あと " + MailApp.getRemainingDailyQuota() + " 通)");
+  Logger.log("準備ができました。次に「デプロイ」→「新しいデプロイ」でウェブアプリとして公開してください。");
+}
