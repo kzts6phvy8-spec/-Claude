@@ -5,13 +5,12 @@
  * - アプリから送られた解析依頼 (画像入り) を Google ドライブの「スクショメモ_解析キュー」フォルダに置く
  * - 1 分ごとに起動して Gemini API に送り、結果を同じフォルダに保存する
  * - アプリを開くと結果を受け取り、受け取った結果は削除する
- * - 送った分の解析が全部終わった時と、無料枠の 1 日の上限に達した時に、Google アカウントのメールに知らせる
  *
  * 指示文・モデルはアプリ側から毎回送られるので、このコードを更新する必要はありません。
  * Gemini の API キーと合言葉は、アプリの「接続テスト」で自動的に登録されます。
  */
 
-const VERSION = 1;
+const VERSION = 2;
 const FOLDER_NAME = "スクショメモ_解析キュー";
 const BATCH = 5; // 1 回にまとめて Gemini へ送る枚数
 const PER_MINUTE = 10; // 1 分あたりに送る最大枚数 (無料枠の 1 分の上限を超えないように)
@@ -90,7 +89,6 @@ function enqueue(jobs) {
     });
     added++;
   });
-  if (added) PropertiesService.getScriptProperties().setProperty("NOTIFY_DONE", "1");
   return { ok: true, added: added };
 }
 
@@ -176,10 +174,7 @@ function processQueue() {
           f.setTrashed(true); // 壊れた依頼は捨てる
         }
       });
-      if (jobs.length === 0) {
-        notifyDone(props, folder);
-        return;
-      }
+      if (jobs.length === 0) return;
       props.setProperty("LAST_RUN", String(Date.now()));
 
       const responses = UrlFetchApp.fetchAll(
@@ -223,10 +218,7 @@ function processQueue() {
         finish(folder, j, { id: j.job.id, ok: false, status: code, error: text.slice(0, 2000) });
       });
       props.deleteProperty("LAST_ERROR");
-      if (rateLimited) {
-        notifyLimit(props, folder);
-        return;
-      }
+      if (rateLimited) return;
       // 1 分あたりの枚数を超えないように待つ
       const wait = gap - (Date.now() - batchStarted);
       if (wait > 0) {
@@ -240,46 +232,6 @@ function processQueue() {
   } finally {
     lock.releaseLock();
   }
-}
-
-// ---------------- メールでの知らせ ----------------
-
-function sendNotice(props, subject, lines) {
-  try {
-    const to = Session.getEffectiveUser().getEmail();
-    if (!to) return;
-    const url = props.getProperty("APP_URL");
-    MailApp.sendEmail(to, "【スクショメモ】" + subject, lines.concat(url ? ["", "アプリを開く: " + url] : []).join("\n"));
-  } catch (err) {
-    Logger.log("知らせのメールを送れませんでした: " + err);
-  }
-}
-
-/** 送られた分の解析が全部終わった: 1 回だけ知らせる */
-function notifyDone(props, folder) {
-  if (!props.getProperty("NOTIFY_DONE")) return;
-  props.deleteProperty("NOTIFY_DONE");
-  const ready = countFiles(folder).ready;
-  if (ready === 0) return; // もうアプリが受け取った
-  sendNotice(props, "解析が終わりました (" + ready + " 件)", [
-    "送ったスクリーンショットの解析が、サーバーですべて終わりました。",
-    "アプリを開くと結果を受け取ります。「メモアプリに一括保存」でメモに保存してください。",
-  ]);
-}
-
-/** 無料枠の 1 日の上限に達した: その日のうちは 1 回だけ知らせる */
-function notifyLimit(props, folder) {
-  const limit = JSON.parse(props.getProperty("LAST_LIMIT") || "null");
-  if (!limit || !limit.daily) return;
-  const today = Utilities.formatDate(new Date(), "America/Los_Angeles", "yyyy-MM-dd");
-  if (props.getProperty("LIMIT_MAILED") === today) return;
-  props.setProperty("LIMIT_MAILED", today);
-  const c = countFiles(folder);
-  sendNotice(props, "今日の無料枠の上限に達しました", [
-    "Gemini の無料枠の 1 日の上限に達したので、解析を休んでいます (残り " + c.pending + " 件)。",
-    "上限が戻ると (日本時間の 16〜17 時ごろ)、サーバーが自動で続きを解析します。アプリは閉じたままで大丈夫です。",
-    c.ready > 0 ? "解析済みの " + c.ready + " 件は、アプリを開くと受け取れます。" : "",
-  ]);
 }
 
 function finish(folder, j, result) {
@@ -371,6 +323,5 @@ function json(obj) {
 function setup() {
   getFolder();
   ensureTrigger();
-  Logger.log("知らせのメールの送り先: " + Session.getEffectiveUser().getEmail() + " (今日あと " + MailApp.getRemainingDailyQuota() + " 通)");
   Logger.log("準備ができました。次に「デプロイ」→「新しいデプロイ」でウェブアプリとして公開してください。");
 }
