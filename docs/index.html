@@ -274,8 +274,8 @@
     </label>
     <label>メモアプリへの保存方法
       <select id="saveMethod">
-        <option value="shortcut">ショートカット経由（1枚 = 1メモ）</option>
-        <option value="share">共有シート（まとめて1つのメモ）</option>
+        <option value="shortcut">ショートカット経由（おすすめ）</option>
+        <option value="share">共有シート（毎回、送り先を手で選ぶ）</option>
       </select>
       <small>「ショートカット経由」は iPhone の「ショートカット」アプリに下記の名前のショートカットを作っておく必要があります（作り方は README 参照）。</small>
     </label>
@@ -308,7 +308,8 @@
       <small>既定は <code>gemini-flash-lite-latest</code>（最新の Flash-Lite）。固定したい場合は <code>gemini-2.5-flash-lite</code> などを入力。</small>
     </label>
     <div class="dlg-buttons">
-      <button type="button" class="btn" id="unsaveAll" style="margin-right:auto">保存済みを全部戻す</button>
+      <button type="button" class="btn" id="unsaveAll">保存済みを全部戻す</button>
+      <button type="button" class="btn" id="dropSaved" style="margin-right:auto">保存済みを履歴から消す</button>
       <button type="button" class="btn danger" id="clearAll">履歴を全削除</button>
       <button type="button" class="btn" id="cancelSettings">キャンセル</button>
       <button type="submit" class="btn primary">保存</button>
@@ -492,7 +493,7 @@
       const body = m.quiz ? renderQuizBody(m.quiz) : el('div', { class: 'card-body', text: m.text || (m.skip ? '（クイズ画面ではなかったため、メモにしません）' : '（文字が見つかりませんでした）') });
       const actions = el('div', { class: 'card-actions' }, [
         chip('share', '共有', async () => {
-          if (await shareText(m.quiz ? '' : m.title, m.text)) { m.saved = true; saveMessages(); updateMessage(m); }
+          if (await shareText(m.quiz ? '' : m.title, m.text)) { markSaved(m); saveMessages(); updateMessage(m); }
         }, 'primary'),
         chip('copy', 'コピー', () => copyText(m.text)),
       ]);
@@ -607,6 +608,8 @@
   // ショートカット側でこの区切り文字で分割し、1件ずつ「メモを作成」する
   const MEMO_SEPARATOR = '@@@@';
 
+  function markSaved(m) { m.saved = true; delete m.thumb; }
+
   const unsavedMemos = () => messages.filter(m => m.kind === 'ocr' && m.text && !m.duplicate && !m.saved);
 
   function updateSaveBar() {
@@ -621,12 +624,12 @@
     if (settings.saveMethod === 'shortcut') {
       // 1つのメモにまとめる時は空行で区切る（ショートカット側で分割されないので、1回で1つのメモに入る）
       await copyText(list.map(m => m.text).join(settings.saveJoin === 'each' ? MEMO_SEPARATOR : '\n\n') + '\n', true);
-      list.forEach(m => { m.saved = true; });
+      list.forEach(markSaved);
       saveMessages(); render();
       location.href = 'shortcuts://run-shortcut?name=' + encodeURIComponent(settings.shortcutName) + '&input=clipboard';
     } else {
       const ok = await shareText('', list.map(m => m.text).join('\n\n'));
-      if (ok) { list.forEach(m => { m.saved = true; }); saveMessages(); render(); }
+      if (ok) { list.forEach(markSaved); saveMessages(); render(); }
     }
   }
 
@@ -876,19 +879,16 @@
         Object.assign(job, { base64: p.base64, cropped: p.cropped });
         m.thumb = p.thumb;
       }
-      let quiz = null;
       if (job.mode === 'quiz') {
-        quiz = await ocrQuiz(job.base64, job.instruction);
-        if (!quiz && job.cropped) {
-          // クイズ画面ではなかった → 画像全体を通常モードで読み直す
-          const p = await prepareFile(job.file, 'general');
-          Object.assign(job, { base64: p.base64, cropped: false });
-          m.thumb = p.thumb;
+        const quiz = await ocrQuiz(job.base64, job.instruction);
+        if (quiz) {
+          Object.assign(m, { pending: false, kind: 'ocr', quiz, title: quiz.answer || 'クイズ', text: formatQuiz(quiz) });
+          m.duplicate = isDuplicateQuiz(quiz, m);
+        } else {
+          // クイズ画面ではない → メモにしない（クイズまとめに余計な文章が入らないように）
+          Object.assign(m, { pending: false, kind: 'ocr', title: 'クイズ以外', text: '', skip: true });
+          delete m.quiz; delete m.duplicate;
         }
-      }
-      if (quiz) {
-        Object.assign(m, { pending: false, kind: 'ocr', quiz, title: quiz.answer || 'クイズ', text: formatQuiz(quiz) });
-        m.duplicate = isDuplicateQuiz(quiz, m);
       } else {
         const r = await ocr(job.base64, job.instruction);
         Object.assign(m, { pending: false, kind: 'ocr', title: r.title, text: r.text });
@@ -1082,7 +1082,8 @@
       bar.classList.add('show');
     } else if (waiting) {
       const lim = serverInfo && serverInfo.limit;
-      txt.textContent = serverError ? `サーバーに接続できません：${serverError}`
+      txt.textContent = !settings.bgUrl ? `サーバーで解析待ち ${waiting}件：⚙ でサーバーの URL を入れ直すと受け取れます`
+        : serverError ? `サーバーに接続できません：${serverError}`
         : lim && lim.daily ? `サーバーで解析待ち ${waiting}件・今日の無料枠の上限のため夕方（16〜17時）に自動で再開`
         : `サーバーで解析中 ${waiting}件・約${Math.ceil(waiting / 10)}分（アプリを閉じても続きます）`;
       btn.textContent = '結果を確認'; statusAction = 'poll';
@@ -1328,6 +1329,12 @@
       settings.bgUrl = prevUrl;
       $('bgState').textContent = '✗ ' + e.message;
     }
+  });
+  $('dropSaved').addEventListener('click', () => {
+    const n = messages.filter(m => m.saved).length;
+    if (!n) { toast('保存済みのメモはありません'); return; }
+    if (!confirm(`メモアプリに保存済みの ${n} 件を、このアプリの履歴から消しますか？（メモアプリの中身は消えません）`)) return;
+    messages = messages.filter(m => !m.saved); saveMessages(); render(); dlg.close();
   });
   $('unsaveAll').addEventListener('click', () => {
     const list = messages.filter(m => m.saved);
