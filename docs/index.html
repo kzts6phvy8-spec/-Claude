@@ -279,6 +279,13 @@
       </select>
       <small>「ショートカット経由」は iPhone の「ショートカット」アプリに下記の名前のショートカットを作っておく必要があります（作り方は README 参照）。</small>
     </label>
+    <label>まとめ方
+      <select id="saveJoin">
+        <option value="one">1つのメモにまとめる（おすすめ）</option>
+        <option value="each">1問ずつ別のメモにする</option>
+      </select>
+      <small>「1つのメモにまとめる」は、ショートカットを「メモに追加」に変えると、毎回同じメモの末尾に書き足されます（作り方は README）。</small>
+    </label>
     <label>ショートカット名
       <input type="text" id="shortcutName" autocomplete="off" autocapitalize="off" spellcheck="false">
     </label>
@@ -362,7 +369,7 @@
     }
   };
 
-  let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL, mode: 'quiz', rpm: 10, bgUrl: '', bgToken: '', saveMethod: 'shortcut', shortcutName: 'スクショメモ保存' }, storage.get(KEY_SETTINGS, {}));
+  let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL, mode: 'quiz', rpm: 10, bgUrl: '', bgToken: '', saveMethod: 'shortcut', saveJoin: 'one', shortcutName: 'スクショメモ保存' }, storage.get(KEY_SETTINGS, {}));
   let messages = storage.get(KEY_MESSAGES, []);
   if (!Array.isArray(messages)) messages = [];
   messages = messages.filter(m => !m.pending);
@@ -612,7 +619,8 @@
   async function saveToNotes(list) {
     if (!list.length) { toast('保存するメモがありません'); return; }
     if (settings.saveMethod === 'shortcut') {
-      await copyText(list.map(m => m.text).join(MEMO_SEPARATOR), true);
+      // 1つのメモにまとめる時は空行で区切る（ショートカット側で分割されないので、1回で1つのメモに入る）
+      await copyText(list.map(m => m.text).join(settings.saveJoin === 'each' ? MEMO_SEPARATOR : '\n\n') + '\n', true);
       list.forEach(m => { m.saved = true; });
       saveMessages(); render();
       location.href = 'shortcuts://run-shortcut?name=' + encodeURIComponent(settings.shortcutName) + '&input=clipboard';
@@ -1272,6 +1280,7 @@
     $('model').value = settings.model || DEFAULT_MODEL;
     $('saveMethod').value = settings.saveMethod;
     $('shortcutName').value = settings.shortcutName;
+    $('saveJoin').value = settings.saveJoin || 'one';
     $('rpm').value = settings.rpm;
     $('bgUrl').value = settings.bgUrl;
     $('bgState').textContent = settings.bgUrl ? '接続先が設定されています（送信はサーバー経由になります）' : '未設定（送信はこの画面の中で解析します）';
@@ -1284,6 +1293,7 @@
     settings.model = $('model').value.trim() || DEFAULT_MODEL;
     settings.saveMethod = $('saveMethod').value;
     settings.shortcutName = $('shortcutName').value.trim() || 'スクショメモ保存';
+    settings.saveJoin = $('saveJoin').value;
     settings.rpm = Math.min(1000, Math.max(1, parseInt($('rpm').value, 10) || 10));
     settings.bgUrl = $('bgUrl').value.trim();
     // APIキーを変えたときは、サーバーにも新しいキーを登録する
