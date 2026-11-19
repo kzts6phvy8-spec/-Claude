@@ -1,0 +1,25 @@
+name: ScreenMemo
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  ScreenMemo:
+    type: application
+    platform: iOS
+    sources: [ScreenMemo]
+    info:
+      path: ScreenMemo/Info.plist
+      properties:
+        CFBundleDisplayName: スクショメモ
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSPhotoLibraryUsageDescription: スクリーンショットを読み取ってテキスト化し、不要になった画像を削除するために写真ライブラリへアクセスします。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.screenmemo
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
