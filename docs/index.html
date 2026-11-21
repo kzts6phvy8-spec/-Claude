@@ -980,16 +980,21 @@
           });
         } catch { failed++; }
       }
+      // 解析待ちのカードは送る前に作る（送っている最中にサーバーが解析して結果が先に届いても、このカードに入る）
+      group.forEach(g => addMessage(g.msg));
+      saveMessages();
       let ok = false, lastErr;
       for (let attempt = 0; attempt < 3 && !ok && group.length; attempt++) {
         try { await callServer('enqueue', { jobs: group.map(g => g.job) }); ok = true; }
         catch (e) { lastErr = e; await sleep(2000 * (attempt + 1)); }
       }
       if (ok) {
-        group.forEach(g => addMessage(g.msg));
         sent += group.length;
-        saveMessages();
       } else if (group.length) {
+        // 送れなかった分のカードは消す（まだ待ちのままのものだけ）
+        const ids = new Set(group.map(g => g.msg.id));
+        messages = messages.filter(m => !(ids.has(m.id) && m.kind === 'remote'));
+        saveMessages(); render();
         failed += group.length;
         addMessage({ id: uid(), role: 'model', kind: 'error', text: `${group.length}枚をサーバーに送れませんでした：${lastErr.message}（もう一度選んで送ってください）`, at: Date.now() });
       }
@@ -1010,7 +1015,7 @@
 
   // サーバーの結果を取り込む
   function applyRemoteResult(res) {
-    let m = messages.find(x => x.id === res.id);
+    let m = messages.find(x => x.id === res.id && x.kind === 'remote') || messages.find(x => x.id === res.id);
     if (!m) { m = { id: res.id, role: 'model', at: Date.now() }; messages.push(m); }
     const mode = m.mode || 'quiz';
     delete m.pending;
@@ -1062,6 +1067,12 @@
       polling = false;
       updateStatus();
     }
+  }
+  function dropStaleRemote() {
+    const done = new Set(messages.filter(m => m.kind !== 'remote').map(m => m.id));
+    const before = messages.length;
+    messages = messages.filter(m => !(m.kind === 'remote' && done.has(m.id)));
+    return before - messages.length;
   }
   const remoteWaiting = () => messages.filter(m => m.kind === 'remote').length;
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pollRemote(); });
@@ -1378,6 +1389,7 @@
   }));
   renderMode();
 
+  if (dropStaleRemote()) storage.set(KEY_MESSAGES, messages.filter(m => !m.pending).map(({ _job, thumbs, ...rest }) => rest));
   render();
   updateSaveBar();
   scrollToBottom();
