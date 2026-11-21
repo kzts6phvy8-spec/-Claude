@@ -1091,10 +1091,19 @@
       bar.classList.add('show');
     } else if (waiting) {
       const lim = serverInfo && serverInfo.limit;
+      const srvErr = serverInfo && serverInfo.lastError;
+      const ago = t => t ? `${Math.max(0, Math.round((Date.now() - t) / 60000))}分前` : 'まだ一度もなし';
       txt.textContent = !settings.bgUrl ? `サーバーで解析待ち ${waiting}件：⚙ でサーバーの URL を入れ直すと受け取れます`
         : serverError ? `サーバーに接続できません：${serverError}`
+        : srvErr ? `サーバーで解析待ち ${waiting}件・サーバーでエラー：${srvErr.message}`
+        : serverInfo && serverInfo.pending === 0 && serverInfo.ready === 0
+          ? `解析待ち ${waiting}件がサーバーに見つかりません（送信が届かなかった可能性）。カードの「取消」で消して、もう一度送ってください`
+        : serverInfo && !serverInfo.lastRunAt
+          ? `サーバーで解析待ち ${waiting}件・サーバーがまだ一度も解析していません（Apps Script のトリガーを確認してください）`
+        : lim && !lim.daily ? `サーバーで解析待ち ${waiting}件・1分あたりの上限のため少し待っています（最後の解析：${ago(serverInfo.lastRunAt)}）`
+        : serverError ? `サーバーに接続できません：${serverError}`
         : lim && lim.daily ? `サーバーで解析待ち ${waiting}件・今日の無料枠の上限のため夕方（16〜17時）に自動で再開`
-        : `サーバーで解析中 ${waiting}件・約${Math.ceil(waiting / 10)}分（アプリを閉じても続きます）`;
+        : `サーバーで解析中 ${waiting}件・約${Math.ceil(waiting / 10)}分（最後の解析：${ago(serverInfo && serverInfo.lastRunAt)}）`;
       btn.textContent = '結果を確認'; statusAction = 'poll';
       btn.hidden = polling;
       bar.classList.add('show');
