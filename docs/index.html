@@ -326,6 +326,7 @@
   const DEFAULT_MODEL = 'gemini-flash-lite-latest';
   const KEY_SETTINGS = 'screenmemo.settings';
   const KEY_MESSAGES = 'screenmemo.messages';
+  const KEY_SEEN = 'screenmemo.seenQuestions';
   const CONCURRENCY = 2;
   const MAX_PER_BATCH = 500;   // 1回に追加できる枚数（無料枠1日の上限の目安）
   const PREVIEW = 20;          // 入力欄に並べるサムネイルの数
@@ -435,7 +436,7 @@
         el('ol', {}, [
           el('li', { text: settings.apiKey ? '✓ APIキー設定済み' : '右上の ⚙ から Gemini APIキーを設定' }),
           el('li', { text: '左下の画像ボタンでスクショを選択（複数可）' }),
-          el('li', { text: '送信 → 結果の「共有」から「メモ」アプリへ保存' }),
+          el('li', { text: '送信 → 下の「メモアプリに一括保存」でメモアプリへ' }),
           el('li', { text: '保存したら写真アプリでスクショを削除して容量を空ける' })
         ])
       ]);
@@ -491,7 +492,7 @@
     }
     if (m.kind === 'ocr') {
       const body = m.quiz ? renderQuizBody(m.quiz) : el('div', { class: 'card-body', text: m.text || (m.skip ? '（クイズ画面ではなかったため、メモにしません）' : '（文字が見つかりませんでした）') });
-      const actions = el('div', { class: 'card-actions' }, [
+      const actions = m.skip ? el('div', { class: 'card-actions' }) : el('div', { class: 'card-actions' }, [
         chip('share', '共有', async () => {
           if (await shareText(m.quiz ? '' : m.title, m.text)) { markSaved(m); saveMessages(); updateMessage(m); }
         }, 'primary'),
@@ -549,9 +550,17 @@
 
   const normalize = t => (t || '').replace(/[\s\u3000、。，．,.・「」『』？?！!]/g, '');
 
+  // 履歴から消した保存済みの問題も覚えておく（同じ問題をもう一度送っても二重保存しない）
+  const seenQuestions = new Set(storage.get(KEY_SEEN, []));
+  function rememberSaved(list) {
+    list.forEach(m => { if (m.saved && m.quiz) seenQuestions.add(normalize(m.quiz.question)); });
+    if (!storage.set(KEY_SEEN, [...seenQuestions])) toast('保存容量が足りず、重複チェック用の記録を保存できませんでした');
+  }
+
   function isDuplicateQuiz(q, self) {
     const key = normalize(q.question);
-    return !!key && messages.some(m => m !== self && m.quiz && !m.duplicate && normalize(m.quiz.question) === key);
+    if (!key) return false;
+    return seenQuestions.has(key) || messages.some(m => m !== self && m.quiz && !m.duplicate && normalize(m.quiz.question) === key);
   }
 
   function updateMessage(m) {
@@ -1333,7 +1342,8 @@
   $('dropSaved').addEventListener('click', () => {
     const n = messages.filter(m => m.saved).length;
     if (!n) { toast('保存済みのメモはありません'); return; }
-    if (!confirm(`メモアプリに保存済みの ${n} 件を、このアプリの履歴から消しますか？（メモアプリの中身は消えません）`)) return;
+    if (!confirm(`メモアプリに保存済みの ${n} 件を、このアプリの履歴から消しますか？（メモアプリの中身は消えません。同じ問題をまた送っても「重複」として扱います）`)) return;
+    rememberSaved(messages);
     messages = messages.filter(m => !m.saved); saveMessages(); render(); dlg.close();
   });
   $('unsaveAll').addEventListener('click', () => {
@@ -1344,6 +1354,7 @@
   });
   $('clearAll').addEventListener('click', () => {
     if (!confirm('すべての履歴（メモ）を削除します。よろしいですか？')) return;
+    rememberSaved(messages);
     messages = []; saveMessages(); render(); dlg.close();
   });
 

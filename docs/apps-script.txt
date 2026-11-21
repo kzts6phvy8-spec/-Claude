@@ -10,7 +10,7 @@
  * Gemini の API キーと合言葉は、アプリの「接続テスト」で自動的に登録されます。
  */
 
-const VERSION = 2;
+const VERSION = 3;
 const FOLDER_NAME = "スクショメモ_解析キュー";
 const BATCH = 5; // 1 回にまとめて Gemini へ送る枚数
 const PER_MINUTE = 10; // 1 分あたりに送る最大枚数 (無料枠の 1 分の上限を超えないように)
@@ -268,7 +268,8 @@ function listFiles(folder, prefix, limit) {
     const it = folder.getFiles();
     while (it.hasNext() && out.length < limit) {
       const f = it.next();
-      if (f.getName().indexOf(prefix) === 0) out.push(f);
+      // ゴミ箱に入れた（処理済みの）ファイルは扱わない
+      if (f.getName().indexOf(prefix) === 0 && !f.isTrashed()) out.push(f);
     }
     return out;
   });
@@ -280,9 +281,12 @@ function countFiles(folder) {
     let ready = 0;
     const it = folder.getFiles();
     while (it.hasNext()) {
-      const n = it.next().getName();
+      const f = it.next();
+      const n = f.getName();
+      if (n.indexOf("job_") !== 0 && n.indexOf("result_") !== 0) continue;
+      if (f.isTrashed()) continue;
       if (n.indexOf("job_") === 0) pending++;
-      else if (n.indexOf("result_") === 0) ready++;
+      else ready++;
     }
     return { pending: pending, ready: ready };
   });
