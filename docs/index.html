@@ -297,6 +297,7 @@
         <input type="url" id="bgUrl" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://script.google.com/macros/s/…/exec">
       </label>
       <button type="button" class="btn" id="bgTest">③ 接続テスト</button>
+      <button type="button" class="btn" id="bgRecover">消えた結果をサーバーから復元（30日以内）</button>
       <small id="bgState"></small>
     </div>
     <label>1分あたりの解析枚数の上限
@@ -372,23 +373,75 @@
   };
 
   let settings = Object.assign({ apiKey: '', model: DEFAULT_MODEL, mode: 'quiz', rpm: 10, bgUrl: '', bgToken: '', saveMethod: 'shortcut', saveJoin: 'one', shortcutName: 'スクショメモ保存' }, storage.get(KEY_SETTINGS, {}));
-  let messages = storage.get(KEY_MESSAGES, []);
-  if (!Array.isArray(messages)) messages = [];
-  messages = messages.filter(m => !m.pending);
+  // 履歴は IndexedDB に保存する（localStorage は約5MBしかなく、数百件の画像付き履歴で満杯になる）
+  let messages = [];
+  let loaded = false;
+  const idb = {
+    db: null,
+    open() {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('IndexedDB を開けませんでした')), 3000);
+        const r = indexedDB.open('screenmemo', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('kv');
+        r.onsuccess = () => {
+          clearTimeout(timer);
+          this.db = r.result;
+          this.db.onversionchange = () => { this.db.close(); this.db = null; };   // 別の画面が更新・削除する時は閉じて譲る
+          resolve();
+        };
+        r.onerror = r.onblocked = () => { clearTimeout(timer); reject(r.error || new Error('blocked')); };
+      });
+    },
+    req(mode, fn) {
+      return new Promise((resolve, reject) => {
+        const tx = this.db.transaction('kv', mode);
+        const r = fn(tx.objectStore('kv'));
+        tx.oncomplete = () => resolve(r && r.result);
+        tx.onerror = tx.onabort = () => reject(tx.error);
+      });
+    },
+    get(key) { return this.req('readonly', st => st.get(key)); },
+    set(key, value) { return this.req('readwrite', st => st.put(value, key)); }
+  };
+
+  async function loadMessages() {
+    let list = null;
+    try {
+      await idb.open();
+      list = await idb.get('messages');
+      if (!Array.isArray(list)) {
+        // 以前の保存場所（localStorage）から移す
+        list = storage.get(KEY_MESSAGES, []);
+        if (!Array.isArray(list)) list = [];
+        await idb.set('messages', list);
+        try { localStorage.removeItem(KEY_MESSAGES); } catch { /* 無視 */ }
+      }
+    } catch {
+      idb.db = null;
+      list = storage.get(KEY_MESSAGES, []);
+      if (!Array.isArray(list)) list = [];
+    }
+    messages = list.filter(m => !m.pending);
+    loaded = true;
+  }
   let pendingFiles = [];   // { id, file, thumb }
   let busy = 0;
 
+  // 保存は順番に行う。成功したら true（サーバーへの「受け取り済み」はこれを確かめてから送る）
+  let saveChain = Promise.resolve(true);
   function saveMessages() {
     updateSaveBar();
+    if (!loaded) return Promise.resolve(false);   // 読み込み前に空の履歴で上書きしない
     const data = messages.filter(m => !m.pending).map(({ _job, thumbs, ...rest }) => rest);
-    if (storage.set(KEY_MESSAGES, data)) return;
-    // 容量オーバー時は古いサムネイルから削る
-    for (const m of data) {
-      if (m.thumb) delete m.thumb;
-      if (m.thumbs) delete m.thumbs;
-      if (storage.set(KEY_MESSAGES, data)) { toast('保存容量が少ないため古いサムネイルを削除しました'); return; }
-    }
-    toast('保存に失敗しました。古い履歴を削除してください');
+    saveChain = saveChain.then(async () => {
+      if (idb.db) {
+        try { await idb.set('messages', data); return true; } catch { /* 下の方法で試す */ }
+      }
+      if (storage.set(KEY_MESSAGES, data)) return true;
+      toast('端末に保存できませんでした。⚙「保存済みを履歴から消す」で履歴を減らしてください');
+      return false;
+    });
+    return saveChain;
   }
 
   // ---------- DOM ----------
@@ -963,6 +1016,7 @@
   // 画像を準備してサーバーに預ける（8枚ずつまとめて送る）。送り終われば閉じてよい
   async function sendRemote(files, instruction) {
     uploading = true;
+    serverInfo = null;   // 送信前の件数は古くなるので、次に問い合わせるまで使わない
     progress.done = 0; progress.total = files.length;
     updateStatus();
     keepAwake(true);
@@ -1016,7 +1070,7 @@
   // サーバーの結果を取り込む
   function applyRemoteResult(res) {
     let m = messages.find(x => x.id === res.id && x.kind === 'remote') || messages.find(x => x.id === res.id);
-    if (!m) { m = { id: res.id, role: 'model', at: Date.now() }; messages.push(m); }
+    if (!m) { m = { id: res.id, role: 'model', at: res.at || Date.now() }; messages.push(m); }
     const mode = m.mode || 'quiz';
     delete m.pending;
     try {
@@ -1025,7 +1079,9 @@
         throw new Error(`サーバーでの解析に失敗しました（${reason}）。もう一度スクショを送ってください`);
       }
       const raw = extractText(JSON.parse(res.body));
-      if (mode === 'quiz') {
+      let isQuizResult = mode === 'quiz';
+      try { const j = JSON.parse(raw); if ('is_quiz' in j) isQuizResult = true; else if ('title' in j) isQuizResult = false; } catch { /* そのまま */ }
+      if (isQuizResult) {
         const quiz = parseQuiz(raw);
         if (quiz) {
           Object.assign(m, { kind: 'ocr', quiz, title: quiz.answer || 'クイズ', text: formatQuiz(quiz) });
@@ -1044,7 +1100,7 @@
 
   let polling = false;
   async function pollRemote() {
-    if (!settings.bgUrl || polling) return;
+    if (!settings.bgUrl || polling || !loaded) return;
     polling = true;
     let got = 0;
     try {
@@ -1055,8 +1111,9 @@
         if (!results.length) break;
         results.forEach(applyRemoteResult);
         got += results.length;
-        saveMessages();
         render();
+        // 端末に保存できた時だけ、サーバーの結果を消してもらう（保存に失敗したら次回また受け取る）
+        if (!(await saveMessages())) throw new Error('端末に保存できなかったため、結果はサーバーに残しています');
         await callServer('ack', { ids: results.map(x => x.id) });
         if (results.length < 50) break;
       }
@@ -1114,7 +1171,7 @@
         : lim && !lim.daily ? `サーバーで解析待ち ${waiting}件・1分あたりの上限のため少し待っています（最後の解析：${ago(serverInfo.lastRunAt)}）`
         : serverError ? `サーバーに接続できません：${serverError}`
         : lim && lim.daily ? `サーバーで解析待ち ${waiting}件・今日の無料枠の上限のため夕方（16〜17時）に自動で再開`
-        : `サーバーで解析中 ${waiting}件・約${Math.ceil(waiting / 10)}分（最後の解析：${ago(serverInfo && serverInfo.lastRunAt)}）`;
+        : `サーバーで解析中 ${waiting}件・約${Math.ceil(waiting / 10)}分` + (serverInfo ? `（最後の解析：${ago(serverInfo.lastRunAt)}）` : '（アプリを閉じても続きます）');
       btn.textContent = '結果を確認'; statusAction = 'poll';
       btn.hidden = polling;
       bar.classList.add('show');
@@ -1359,6 +1416,26 @@
       $('bgState').textContent = '✗ ' + e.message;
     }
   });
+  $('bgRecover').addEventListener('click', async () => {
+    if (!settings.bgUrl) { $('bgState').textContent = '先にサーバーの URL を設定してください'; return; }
+    $('bgState').textContent = 'サーバーのゴミ箱から結果を探しています…（数十秒〜数分）';
+    try {
+      const r = await callServer('recover', { sinceDays: 30 });
+      const have = new Set(messages.filter(m => m.kind === 'ocr' || m.kind === 'error').map(m => m.id));
+      const list = (r.results || []).filter(x => !have.has(x.id)).sort((a, b) => (a.at || 0) - (b.at || 0));
+      list.forEach(applyRemoteResult);
+      dropStaleRemote();
+      const ok = await saveMessages();
+      render(); scrollToBottom();
+      $('bgState').textContent = ok
+        ? `✓ ${list.length}件を復元しました（すでにあった ${(r.results || []).length - list.length}件は除外）`
+        : '✗ 復元した結果を端末に保存できませんでした';
+    } catch (e) {
+      $('bgState').textContent = /不明な操作/.test(e.message)
+        ? '✗ サーバーのコードが古いため復元できません。① でコードをコピーして貼り直し、「デプロイを管理」→ 新バージョンでデプロイしてください'
+        : '✗ ' + e.message;
+    }
+  });
   $('dropSaved').addEventListener('click', () => {
     const n = messages.filter(m => m.saved).length;
     if (!n) { toast('保存済みのメモはありません'); return; }
@@ -1389,11 +1466,13 @@
   }));
   renderMode();
 
-  if (dropStaleRemote()) storage.set(KEY_MESSAGES, messages.filter(m => !m.pending).map(({ _job, thumbs, ...rest }) => rest));
-  render();
-  updateSaveBar();
-  scrollToBottom();
-  pollRemote();
+  loadMessages().then(() => {
+    if (dropStaleRemote()) saveMessages();
+    render();
+    updateSaveBar();
+    scrollToBottom();
+    pollRemote();
+  });
   if (!settings.apiKey) setTimeout(openSettings, 300);
 })();
 </script>

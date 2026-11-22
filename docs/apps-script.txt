@@ -10,7 +10,7 @@
  * Gemini の API キーと合言葉は、アプリの「接続テスト」で自動的に登録されます。
  */
 
-const VERSION = 3;
+const VERSION = 4;
 const FOLDER_NAME = "スクショメモ_解析キュー";
 const BATCH = 5; // 1 回にまとめて Gemini へ送る枚数
 const PER_MINUTE = 10; // 1 分あたりに送る最大枚数 (無料枠の 1 分の上限を超えないように)
@@ -55,6 +55,9 @@ function doPost(e) {
       case "cancel":
         trashByIds(req.ids || [], "job_");
         return json({ ok: true });
+      case "recover":
+        // 受け取り済みでゴミ箱に入れた結果（30 日間残る）を返す。アプリ側の保存に失敗した時の復元用
+        return json({ ok: true, version: VERSION, results: recoverResults(Number(req.sinceDays) || 30) });
       case "status":
         return json({ ok: true, version: VERSION, ...counts() });
       case "kick":
@@ -103,6 +106,35 @@ function takeResults(limit) {
       if (!isDriveError(err)) f.setTrashed(true); // 壊れた結果は捨てる
     }
   });
+  return out;
+}
+
+function recoverResults(sinceDays) {
+  const since = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
+  const folderId = getFolder().getId();
+  const seen = {};
+  const out = [];
+  const it = retry(function () {
+    return DriveApp.getTrashedFiles();
+  });
+  while (it.hasNext()) {
+    const f = it.next();
+    const name = f.getName();
+    if (name.indexOf("result_") !== 0 || seen[name]) continue;
+    if (f.getLastUpdated().getTime() < since) continue;
+    let inFolder = false;
+    const parents = f.getParents();
+    while (parents.hasNext()) if (parents.next().getId() === folderId) inFolder = true;
+    if (!inFolder) continue;
+    seen[name] = true;
+    try {
+      const r = JSON.parse(f.getBlob().getDataAsString());
+      r.at = f.getDateCreated().getTime();
+      out.push(r);
+    } catch (err) {
+      // 読めないものは飛ばす
+    }
+  }
   return out;
 }
 
