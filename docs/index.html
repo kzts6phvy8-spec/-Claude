@@ -1495,22 +1495,37 @@
   });
   $('bgRecover').addEventListener('click', async () => {
     if (!settings.bgUrl) { $('bgState').textContent = '先にサーバーの URL を設定してください'; return; }
-    $('bgState').textContent = 'サーバーのゴミ箱から結果を探しています…（数十秒〜数分）';
+    const btn = $('bgRecover');
+    btn.disabled = true;
+    keepAwake(true);
+    const found = new Map();
+    let cursor = null, rounds = 0;
     try {
-      const r = await callServer('recover', { sinceDays: 30 });
+      // サーバーは 40 秒ずつ区切って返すので、続きがある限り取りに行く
+      do {
+        $('bgState').textContent = `サーバーのゴミ箱から結果を探しています…（${found.size}件見つかりました・画面を開いたままに）`;
+        const r = await callServer('recover', cursor ? { cursor } : {});
+        (r.results || []).forEach(x => found.set(x.id, x));
+        cursor = r.cursor || null;
+        rounds++;
+      } while (cursor && rounds < 60);
       const have = new Set(messages.filter(m => m.kind === 'ocr' || m.kind === 'error').map(m => m.id));
-      const list = (r.results || []).filter(x => !have.has(x.id)).sort((a, b) => (a.at || 0) - (b.at || 0));
+      const all = [...found.values()];
+      const list = all.filter(x => !have.has(x.id)).sort((a, b) => (a.at || 0) - (b.at || 0) || (a.id < b.id ? -1 : 1));
       list.forEach(applyRemoteResult);
       dropStaleRemote();
       const ok = await saveMessages();
       render(); scrollToBottom();
-      $('bgState').textContent = ok
-        ? `✓ ${list.length}件を復元しました（すでにあった ${(r.results || []).length - list.length}件は除外）`
-        : '✗ 復元した結果を端末に保存できませんでした';
+      $('bgState').textContent = !ok ? '✗ 復元した結果を端末に保存できませんでした'
+        : all.length === 0 ? '✗ サーバーのゴミ箱に結果が見つかりませんでした（Google ドライブのゴミ箱を空にした、または30日を過ぎた可能性があります）'
+        : `✓ ${list.length}件を復元しました（すでにあった ${all.length - list.length}件は除外）`;
     } catch (e) {
       $('bgState').textContent = /不明な操作/.test(e.message)
         ? '✗ サーバーのコードが古いため復元できません。① でコードをコピーして貼り直し、「デプロイを管理」→ 新バージョンでデプロイしてください'
-        : '✗ ' + e.message;
+        : `✗ ${e.message}（見つかった ${found.size}件は未反映です。もう一度押してください）`;
+    } finally {
+      btn.disabled = false;
+      keepAwake(false);
     }
   });
   $('dropSaved').addEventListener('click', () => {

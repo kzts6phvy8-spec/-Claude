@@ -10,7 +10,7 @@
  * Gemini の API キーと合言葉は、アプリの「接続テスト」で自動的に登録されます。
  */
 
-const VERSION = 5;
+const VERSION = 6;
 const FOLDER_NAME = "スクショメモ_解析キュー";
 const BATCH = 5; // 1 回にまとめて Gemini へ送る枚数
 const PER_MINUTE = 10; // 1 分あたりに送る最大枚数 (無料枠の 1 分の上限を超えないように)
@@ -57,7 +57,8 @@ function doPost(e) {
         return json({ ok: true });
       case "recover":
         // 受け取り済みでゴミ箱に入れた結果（30 日間残る）を返す。アプリ側の保存に失敗した時の復元用
-        return json({ ok: true, version: VERSION, results: recoverResults(Number(req.sinceDays) || 30) });
+        // 40 秒ずつ区切って返す。続きがある時は cursor を返すので、アプリは続きを取りに来る
+        return json(Object.assign({ ok: true, version: VERSION }, recoverResults(req.cursor || null)));
       case "status":
         return json({ ok: true, version: VERSION, ...counts() });
       case "kick":
@@ -109,33 +110,28 @@ function takeResults(limit) {
   return out;
 }
 
-function recoverResults(sinceDays) {
-  const since = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
-  const folderId = getFolder().getId();
-  const seen = {};
-  const out = [];
+function recoverResults(cursor) {
+  const started = Date.now();
+  // ゴミ箱全体ではなく、JSON ファイルだけを検索し、このアプリの結果ファイル (result_〜) を集める
   const it = retry(function () {
-    return DriveApp.getTrashedFiles();
+    // 名前の検索は記号の扱いが不確かなので、ファイルの種類 (JSON) で探して名前はここで確かめる
+    return cursor ? DriveApp.continueFileIterator(cursor) : DriveApp.searchFiles('trashed = true and mimeType = "application/json"');
   });
+  const out = [];
   while (it.hasNext()) {
+    if (Date.now() - started > 40 * 1000) return { results: out, cursor: it.getContinuationToken() };
     const f = it.next();
-    const name = f.getName();
-    if (name.indexOf("result_") !== 0 || seen[name]) continue;
-    if (f.getLastUpdated().getTime() < since) continue;
-    let inFolder = false;
-    const parents = f.getParents();
-    while (parents.hasNext()) if (parents.next().getId() === folderId) inFolder = true;
-    if (!inFolder) continue;
-    seen[name] = true;
+    if (f.getName().indexOf("result_") !== 0) continue;
     try {
       const r = JSON.parse(f.getBlob().getDataAsString());
+      if (!r || !r.id) continue;
       r.at = f.getDateCreated().getTime();
       out.push(r);
     } catch (err) {
       // 読めないものは飛ばす
     }
   }
-  return out;
+  return { results: out, cursor: null };
 }
 
 function trashByIds(ids, prefix) {
