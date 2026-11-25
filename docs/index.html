@@ -163,7 +163,7 @@
     background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 8px 8px 8px 14px; box-shadow: var(--shadow);
   }
   .savebar.show { display: flex; }
-  .savebar span { flex: 1; font-size: 14px; }
+  .savebar span { flex: 1; font-size: 14px; white-space: pre-line; }
   .savebar b { color: var(--accent); }
   .tag.saved { background: #dcefdc; color: #2d6a2d; }
   .pend.more {
@@ -401,7 +401,14 @@
       });
     },
     get(key) { return this.req('readonly', st => st.get(key)); },
-    set(key, value) { return this.req('readwrite', st => st.put(value, key)); }
+    set(key, value) { return this.req('readwrite', st => st.put(value, key)); },
+    del(key) { return this.req('readwrite', st => st.delete(key)); }
+  };
+  // 再送用に、サーバーへ送る依頼（画像入り）を結果が届くまで端末に取っておく
+  const jobStore = {
+    put: (id, job) => idb.db ? idb.set('job:' + id, job).catch(() => {}) : Promise.resolve(),
+    get: id => idb.db ? idb.get('job:' + id).catch(() => null) : Promise.resolve(null),
+    del: id => idb.db ? idb.del('job:' + id).catch(() => {}) : Promise.resolve()
   };
 
   async function loadMessages() {
@@ -450,6 +457,13 @@
   const fileEl = $('file'), pendingEl = $('pending'), dlg = $('settings');
 
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  // 送った順に並ぶ ID（サーバーはこの順に解析する）
+  let seqLast = 0, seqN = 0;
+  const seqId = () => {
+    const t = Date.now();
+    if (t === seqLast) seqN++; else { seqLast = t; seqN = 0; }
+    return t.toString(36).padStart(9, '0') + seqN.toString(36).padStart(3, '0') + Math.random().toString(36).slice(2, 5);
+  };
   const fmtDate = ts => new Date(ts).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
   function el(tag, attrs = {}, children = []) {
@@ -518,8 +532,11 @@
       wrap.append(el('div', { class: 'card' }, [
         el('div', { class: 'card-head' }, [
           m.thumb ? el('img', { src: m.thumb, alt: '' }) : null,
-          el('div', { class: 'loading', style: 'flex:1;padding:0' }, [dots, el('span', { text: 'サーバーで解析待ち（アプリを閉じても続きます）' })]),
-          chip('trash', '取消', () => { callServer('cancel', { ids: [m.id] }).catch(() => {}); removeMessage(m.id); })
+          m.sendFailed
+            ? el('div', { class: 'error', style: 'flex:1;border:none;padding:0;background:none', text: '⚠️ サーバーに送れませんでした（' + m.sendFailed + '）' })
+            : el('div', { class: 'loading', style: 'flex:1;padding:0' }, [dots, el('span', { text: 'サーバーで解析待ち（アプリを閉じても続きます）' })]),
+          m.sendFailed ? chip('retry', '再送', () => resendRemote([m]), 'primary') : null,
+          chip('trash', '取消', () => { callServer('cancel', { ids: [m.id] }).catch(() => {}); jobStore.del(m.id); removeMessage(m.id); })
         ])
       ]));
       return wrap;
@@ -629,6 +646,7 @@
   }
 
   function removeMessage(id) {
+    jobStore.del(id);
     messages = messages.filter(m => m.id !== id);
     saveMessages();
     render();
@@ -983,7 +1001,7 @@
   async function callServer(action, payload = {}) {
     if (!settings.bgUrl) throw new Error('サーバーの URL が未設定です');
     const controller = new AbortController();
-    const timer = action === 'kick' ? null : setTimeout(() => controller.abort(), 90000);
+    const timer = action === 'kick' ? null : setTimeout(() => controller.abort(), action === 'enqueue' || action === 'recover' ? 180000 : 90000);
     let res;
     try {
       res = await fetch(settings.bgUrl, {
@@ -1014,6 +1032,18 @@
   }
 
   // 画像を準備してサーバーに預ける（8枚ずつまとめて送る）。送り終われば閉じてよい
+  const SEND_GROUP = 4;   // 1回にサーバーへ送る枚数（多いと時間切れになりやすい）
+
+  async function enqueueGroup(group) {
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { await callServer('enqueue', { jobs: group.map(g => g.job) }); return null; }
+      catch (e) { lastErr = e; await sleep(3000 * (attempt + 1)); }
+    }
+    return lastErr;
+  }
+
+  // 画像を準備してサーバーに預ける。送り終われば閉じてよい
   async function sendRemote(files, instruction) {
     uploading = true;
     serverInfo = null;   // 送信前の件数は古くなるので、次に問い合わせるまで使わない
@@ -1021,51 +1051,81 @@
     updateStatus();
     keepAwake(true);
     const model = (settings.model || DEFAULT_MODEL).trim().replace(/^models\//, '');
+    const batch = Date.now();
     let sent = 0, failed = 0;
-    for (let i = 0; i < files.length; i += 8) {
+    for (let i = 0; i < files.length; i += SEND_GROUP) {
       const group = [];
-      for (const f of files.slice(i, i + 8)) {
+      for (const f of files.slice(i, i + SEND_GROUP)) {
         try {
           const p = await prepareFile(f.file, settings.mode);
-          const id = uid();
-          group.push({
-            msg: { id, role: 'model', kind: 'remote', mode: settings.mode, thumb: p.thumb, at: Date.now() },
-            job: { id, model, body: settings.mode === 'quiz' ? quizBody(p.base64, instruction) : generalBody(p.base64, instruction) }
-          });
+          const id = seqId();
+          const job = { id, model, body: settings.mode === 'quiz' ? quizBody(p.base64, instruction) : generalBody(p.base64, instruction) };
+          group.push({ msg: { id, role: 'model', kind: 'remote', mode: settings.mode, batch, thumb: p.thumb, at: Date.now() }, job });
+          await jobStore.put(id, job);
         } catch { failed++; }
       }
-      // 解析待ちのカードは送る前に作る（送っている最中にサーバーが解析して結果が先に届いても、このカードに入る）
+      // 待ちのカードは送る前に作る（送っている最中に結果が先に届いても、このカードに入る）
       group.forEach(g => addMessage(g.msg));
       saveMessages();
-      let ok = false, lastErr;
-      for (let attempt = 0; attempt < 3 && !ok && group.length; attempt++) {
-        try { await callServer('enqueue', { jobs: group.map(g => g.job) }); ok = true; }
-        catch (e) { lastErr = e; await sleep(2000 * (attempt + 1)); }
-      }
-      if (ok) {
+      const err = group.length ? await enqueueGroup(group) : null;
+      if (!err) {
         sent += group.length;
-      } else if (group.length) {
-        // 送れなかった分のカードは消す（まだ待ちのままのものだけ）
-        const ids = new Set(group.map(g => g.msg.id));
-        messages = messages.filter(m => !(ids.has(m.id) && m.kind === 'remote'));
-        saveMessages(); render();
+      } else {
+        // 送れなかった分は「送信失敗」として残す（画像は端末に取ってあるので再送できる）
+        group.forEach(g => { g.msg.sendFailed = err.message; updateMessage(g.msg); });
+        saveMessages();
         failed += group.length;
-        addMessage({ id: uid(), role: 'model', kind: 'error', text: `${group.length}枚をサーバーに送れませんでした：${lastErr.message}（もう一度選んで送ってください）`, at: Date.now() });
       }
-      progress.done = Math.min(files.length, i + 8);
+      progress.done = Math.min(files.length, i + SEND_GROUP);
       updateStatus();
     }
     progress.total = 0;
     uploading = false;
     keepAwake(false);
     if (sent) {
-      toast(`${sent}枚をサーバーに預けました。アプリを閉じても解析が続きます`);
+      toast(`${sent}枚をサーバーに預けました。アプリを閉じても解析が続きます` + (failed ? `（送れなかった ${failed}枚は下の「失敗分を再送」で送り直せます）` : ''));
       callServer('kick').catch(() => {});   // 1分ごとの起動を待たずに解析を始めてもらう
       setTimeout(pollRemote, 60000);
+    } else if (failed) {
+      toast('サーバーに送れませんでした。下の「失敗分を再送」で送り直せます');
     }
-    if (failed && !sent) toast('サーバーに送れませんでした');
     updateStatus();
   }
+
+  // 失敗したものを、取っておいた画像で送り直す
+  async function resendRemote(list) {
+    if (!list.length || uploading) return;
+    uploading = true;
+    progress.done = 0; progress.total = list.length;
+    updateStatus();
+    keepAwake(true);
+    let sent = 0, missing = 0;
+    for (let i = 0; i < list.length; i += SEND_GROUP) {
+      const group = [];
+      for (const m of list.slice(i, i + SEND_GROUP)) {
+        const job = await jobStore.get(m.id);
+        if (!job) { missing++; continue; }
+        Object.assign(m, { kind: 'remote', mode: m.mode || 'quiz' });
+        delete m.sendFailed; delete m.retry; delete m.text;
+        updateMessage(m);
+        group.push({ msg: m, job });
+      }
+      const err = group.length ? await enqueueGroup(group) : null;
+      if (err) group.forEach(g => { g.msg.sendFailed = err.message; updateMessage(g.msg); });
+      else sent += group.length;
+      saveMessages();
+      progress.done = Math.min(list.length, i + SEND_GROUP);
+      updateStatus();
+    }
+    progress.total = 0;
+    uploading = false;
+    keepAwake(false);
+    if (sent) { callServer('kick').catch(() => {}); setTimeout(pollRemote, 60000); }
+    toast(`${sent}枚を送り直しました` + (missing ? `（画像が残っていない ${missing}枚は、もう一度スクショを選んで送ってください）` : ''));
+    updateStatus();
+  }
+
+  const failedRemote = () => messages.filter(m => (m.kind === 'remote' && m.sendFailed) || (m.kind === 'error' && m.retry && m.retry.type === 'remote'));
 
   // サーバーの結果を取り込む
   function applyRemoteResult(res) {
@@ -1075,7 +1135,7 @@
     delete m.pending;
     try {
       if (!res.ok) {
-        const reason = res.status === 400 ? '要求が正しくありませんでした' : `HTTP ${res.status}`;
+        const reason = res.status === 400 ? '要求が正しくありませんでした' : res.error && /何度やり直しても/.test(res.error) ? res.error : `HTTP ${res.status}`;
         throw new Error(`サーバーでの解析に失敗しました（${reason}）。もう一度スクショを送ってください`);
       }
       const raw = extractText(JSON.parse(res.body));
@@ -1093,8 +1153,9 @@
         const r = parseGeneral(raw);
         Object.assign(m, { kind: 'ocr', title: r.title, text: r.text });
       }
+      jobStore.del(m.id);
     } catch (e) {
-      Object.assign(m, { kind: 'error', text: e.message });
+      Object.assign(m, { kind: 'error', text: e.message.replace('もう一度スクショを送ってください', '「再試行」で送り直せます'), retry: { type: 'remote' } });
     }
   }
 
@@ -1131,7 +1192,7 @@
     messages = messages.filter(m => !(m.kind === 'remote' && done.has(m.id)));
     return before - messages.length;
   }
-  const remoteWaiting = () => messages.filter(m => m.kind === 'remote').length;
+  const remoteWaiting = () => messages.filter(m => m.kind === 'remote' && !m.sendFailed).length;
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pollRemote(); });
   setInterval(() => {
     if (document.visibilityState === 'visible' && (remoteWaiting() || (serverInfo && serverInfo.ready))) pollRemote();
@@ -1143,6 +1204,12 @@
     const failed = messages.filter(m => m.kind === 'error' && m._job).length;
     const bar = $('statusbar'), txt = $('statusText'), btn = $('retryAll');
     const waiting = remoteWaiting();
+    const failedR = failedRemote().length;
+    // 最後に送った分の内訳（完了 / 待ち / 失敗）
+    const lastBatch = messages.reduce((x, m) => Math.max(x, m.batch || 0), 0);
+    const inBatch = lastBatch ? messages.filter(m => m.batch === lastBatch) : [];
+    const doneB = inBatch.filter(m => m.kind === 'ocr').length;
+    const summary = inBatch.length ? `最後に送った${inBatch.length}枚：完了 ${doneB}・待ち ${inBatch.filter(m => m.kind === 'remote' && !m.sendFailed).length}・失敗 ${inBatch.length - doneB - inBatch.filter(m => m.kind === 'remote' && !m.sendFailed).length}\n` : '';
     if (uploading && progress.total) {
       txt.textContent = `サーバーへ送信中 ${progress.done} / ${progress.total} 枚（送り終わるまで開いたままに）`;
       btn.hidden = true;
@@ -1152,6 +1219,11 @@
       txt.textContent = `解析中 ${progress.done} / ${progress.total} 枚・残り約${Math.ceil(left / (Number(settings.rpm) || 10))}分`;
       btn.hidden = true;
       bar.classList.add('show');
+    } else if (failedR && !busy) {
+      txt.textContent = summary + `失敗 ${failedR}件（画像は端末に取ってあります）` + (waiting ? `・解析待ち ${waiting}件` : '');
+      btn.textContent = '失敗分を再送'; statusAction = 'resend';
+      btn.hidden = false;
+      bar.classList.add('show');
     } else if (failed && !busy) {
       txt.textContent = `読み取れなかった画像 ${failed} 件`;
       btn.textContent = 'まとめて再試行'; statusAction = 'retry';
@@ -1160,6 +1232,7 @@
     } else if (waiting) {
       const lim = serverInfo && serverInfo.limit;
       const srvErr = serverInfo && serverInfo.lastError;
+      const srvBusy = serverInfo && serverInfo.busy && Date.now() - serverInfo.busy.at < 15 * 60 * 1000;
       const ago = t => t ? `${Math.max(0, Math.round((Date.now() - t) / 60000))}分前` : 'まだ一度もなし';
       txt.textContent = !settings.bgUrl ? `サーバーで解析待ち ${waiting}件：⚙ でサーバーの URL を入れ直すと受け取れます`
         : serverError ? `サーバーに接続できません：${serverError}`
@@ -1171,7 +1244,9 @@
         : lim && !lim.daily ? `サーバーで解析待ち ${waiting}件・1分あたりの上限のため少し待っています（最後の解析：${ago(serverInfo.lastRunAt)}）`
         : serverError ? `サーバーに接続できません：${serverError}`
         : lim && lim.daily ? `サーバーで解析待ち ${waiting}件・今日の無料枠の上限のため夕方（16〜17時）に自動で再開`
+        : srvBusy ? `サーバーで解析待ち ${waiting}件・${serverInfo.busy.reason}のため、時間をおいて自動でやり直しています（失敗にはしません）`
         : `サーバーで解析中 ${waiting}件・約${Math.ceil(waiting / 10)}分` + (serverInfo ? `（最後の解析：${ago(serverInfo.lastRunAt)}）` : '（アプリを閉じても続きます）');
+      txt.textContent = summary + txt.textContent;
       btn.textContent = '結果を確認'; statusAction = 'poll';
       btn.hidden = polling;
       bar.classList.add('show');
@@ -1210,6 +1285,7 @@
 
   $('retryAll').addEventListener('click', async () => {
     if (statusAction === 'poll') { pollRemote(); return; }
+    if (statusAction === 'resend') { resendRemote(failedRemote()); return; }
     const jobs = messages.filter(m => m.kind === 'error' && m._job).map(m => m._job);
     if (!jobs.length || busy) return;
     setBusy(1);
@@ -1279,6 +1355,7 @@
   }
 
   async function retry(m) {
+    if (m.retry.type === 'remote') { resendRemote([m]); return; }
     if (m.retry.type === 'ocr' && !m._job) {
       toast('画像がもう手元にないため、もう一度スクショを送ってください');
       return;
