@@ -10,7 +10,7 @@
  * Gemini の API キーと合言葉は、アプリの「接続テスト」で自動的に登録されます。
  */
 
-const VERSION = 6;
+const VERSION = 7;
 const FOLDER_NAME = "スクショメモ_解析キュー";
 const BATCH = 5; // 1 回にまとめて Gemini へ送る枚数
 const PER_MINUTE = 10; // 1 分あたりに送る最大枚数 (無料枠の 1 分の上限を超えないように)
@@ -84,7 +84,9 @@ function enqueue(jobs) {
     if (!job || !job.id || !job.model || !job.body) return;
     const name = "job_" + job.id + ".json";
     const exists = retry(function () {
-      return folder.getFilesByName(name).hasNext();
+      const it = folder.getFilesByName(name);
+      while (it.hasNext()) if (!it.next().isTrashed()) return true;
+      return false;
     });
     if (exists) return;
     const content = JSON.stringify({ id: job.id, model: job.model, body: job.body, attempts: 0 });
@@ -104,7 +106,8 @@ function takeResults(limit) {
         return f.getBlob().getDataAsString();
       })));
     } catch (err) {
-      if (!isDriveError(err)) f.setTrashed(true); // 壊れた結果は捨てる
+      // 作った直後は中身がまだ読めないことがある。30 分たっても読めない時だけ捨てる
+      if (!isDriveError(err) && isOld(f)) f.setTrashed(true);
     }
   });
   return out;
@@ -207,7 +210,11 @@ function processQueue() {
           jobs.push({ file: f, job: job });
         } catch (err) {
           if (isDriveError(err)) throw err;
-          f.setTrashed(true); // 壊れた依頼は捨てる
+          // 作った直後は中身がまだ読めないことがある (Google ドライブの仕様)。捨てずに次の起動でもう一度読む
+          if (isOld(f)) {
+            const id = f.getName().slice(4, -5);
+            finish(folder, { file: f, job: { id: id } }, { id: id, ok: false, status: 0, error: "依頼を読み込めませんでした" });
+          }
         }
         return false;
       });
@@ -306,6 +313,15 @@ function finish(folder, j, result) {
 }
 
 // ---------------- 補助 ----------------
+
+/** 作ってから 30 分以上たったファイルか */
+function isOld(f) {
+  try {
+    return Date.now() - f.getDateCreated().getTime() > 30 * 60 * 1000;
+  } catch (err) {
+    return false;
+  }
+}
 
 function retry(fn) {
   let lastErr;

@@ -1105,6 +1105,13 @@
       for (const m of list.slice(i, i + SEND_GROUP)) {
         const job = await jobStore.get(m.id);
         if (!job) { missing++; continue; }
+        // 新しい ID で送り直す（古い依頼の結果が後から届いても、別のカードとして「重複」扱いになるだけ）
+        const oldId = m.id, newId = seqId();
+        const old = listEl.querySelector(`[data-id="${oldId}"]`);
+        if (old) old.dataset.id = newId;
+        job.id = newId; m.id = newId;
+        await jobStore.put(newId, job);
+        jobStore.del(oldId);
         Object.assign(m, { kind: 'remote', mode: m.mode || 'quiz' });
         delete m.sendFailed; delete m.retry; delete m.text;
         updateMessage(m);
@@ -1238,7 +1245,7 @@
         : serverError ? `サーバーに接続できません：${serverError}`
         : srvErr ? `サーバーで解析待ち ${waiting}件・サーバーでエラー：${srvErr.message}`
         : serverInfo && serverInfo.pending === 0 && serverInfo.ready === 0
-          ? `解析待ち ${waiting}件がサーバーに見つかりません（送信が届かなかった可能性）。カードの「取消」で消して、もう一度送ってください`
+          ? `解析待ち ${waiting}件がサーバーに見つかりません。右のボタンで送り直せます（画像は端末に取ってあります）`
         : serverInfo && !serverInfo.lastRunAt
           ? `サーバーで解析待ち ${waiting}件・サーバーがまだ一度も解析していません（Apps Script のトリガーを確認してください）`
         : lim && !lim.daily ? `サーバーで解析待ち ${waiting}件・1分あたりの上限のため少し待っています（最後の解析：${ago(serverInfo.lastRunAt)}）`
@@ -1247,7 +1254,9 @@
         : srvBusy ? `サーバーで解析待ち ${waiting}件・${serverInfo.busy.reason}のため、時間をおいて自動でやり直しています（失敗にはしません）`
         : `サーバーで解析中 ${waiting}件・約${Math.ceil(waiting / 10)}分` + (serverInfo ? `（最後の解析：${ago(serverInfo.lastRunAt)}）` : '（アプリを閉じても続きます）');
       txt.textContent = summary + txt.textContent;
-      btn.textContent = '結果を確認'; statusAction = 'poll';
+      const lost = !!(settings.bgUrl && !serverError && !srvErr && serverInfo && serverInfo.pending === 0 && serverInfo.ready === 0);
+      btn.textContent = lost ? '見つからない分を再送' : '結果を確認';
+      statusAction = lost ? 'resendLost' : 'poll';
       btn.hidden = polling;
       bar.classList.add('show');
     } else {
@@ -1286,6 +1295,7 @@
   $('retryAll').addEventListener('click', async () => {
     if (statusAction === 'poll') { pollRemote(); return; }
     if (statusAction === 'resend') { resendRemote(failedRemote()); return; }
+    if (statusAction === 'resendLost') { resendRemote(messages.filter(m => m.kind === 'remote' && !m.sendFailed)); return; }
     const jobs = messages.filter(m => m.kind === 'error' && m._job).map(m => m._job);
     if (!jobs.length || busy) return;
     setBusy(1);
